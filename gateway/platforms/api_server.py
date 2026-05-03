@@ -22,6 +22,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -32,6 +33,7 @@ import re
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 try:
@@ -58,6 +60,40 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+def _default_hermes_state_path(*parts: str) -> str:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home().joinpath(*parts))
+    except Exception:
+        return os.path.expanduser(os.path.join("~", ".hermes", *parts))
+
+
+OPENCLAW_CRON_IMPORT_DEFINITIONS_PATH = os.path.expanduser(
+    os.getenv(
+        "OPENCLAW_CRON_IMPORT_DEFINITIONS_PATH",
+        _default_hermes_state_path(
+            "openclaw-import",
+            "cron-dry-run",
+            "openclaw-cron-dry-run-definitions.json",
+        ),
+    )
+)
+OPENCLAW_CRON_JOBS_PATH = os.path.expanduser(
+    os.getenv(
+        "OPENCLAW_CRON_JOBS_PATH",
+        "/mnt/c/Users/Slowlife/.openclaw/cron/jobs.json",
+    )
+)
+OPENCLAW_SHADOWBAN_DIR = os.getenv(
+    "OPENCLAW_SHADOWBAN_DIR",
+    "/mnt/c/Users/Slowlife/.openclaw/shadowban",
+)
+OPENCLAW_SHADOWBAN_FALLBACK_DIR = os.getenv(
+    "OPENCLAW_SHADOWBAN_FALLBACK_DIR",
+    os.path.expanduser("~/.openclaw/shadowban"),
+)
+MAX_DELETED_THUMBNAILS_PER_ACCOUNT = 3
 
 
 def _normalize_chat_content(
@@ -559,6 +595,485 @@ except ImportError:
     _cron_trigger = None
 
 
+def _resolve_openclaw_shadowban_dir() -> str:
+    candidates = [
+        OPENCLAW_SHADOWBAN_DIR,
+        OPENCLAW_SHADOWBAN_FALLBACK_DIR,
+        os.path.expanduser("~/.openclaw/shadowban"),
+    ]
+    resolved: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        path = os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+        if path in seen:
+            continue
+        seen.add(path)
+        resolved.append(path)
+    for path in resolved:
+        if os.path.isfile(os.path.join(path, "history.json")) or os.path.isfile(os.path.join(path, "config.json")):
+            return path
+    return resolved[0] if resolved else os.path.expanduser("~/.openclaw/shadowban")
+
+
+def _read_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_tweet_id_from_url(url: Any) -> str:
+    if not isinstance(url, str):
+        return ""
+    return url.rstrip("/").split("/")[-1].strip()
+
+
+def _normalize_deleted_status(raw: Any) -> str:
+    return raw if raw in ("excluded", "source_excluded") else "unknown"
+
+
+def _pick_thumbnail_path(paths: List[Any]) -> Optional[str]:
+    for candidate in paths:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _to_wsl_path(path: str) -> str:
+    if re.match(r"^[A-Za-z]:\\", path):
+        drive = path[0].lower()
+        rest = path[2:].replace("\\", "/").lstrip("/")
+        return f"/mnt/{drive}/{rest}"
+    return path.replace("\\", "/") if path.startswith("/") else path
+
+
+def _file_path_to_data_url(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        normalized = _to_wsl_path(path)
+        with open(normalized, "rb") as fh:
+            data = fh.read()
+        lower = normalized.lower()
+        if lower.endswith((".jpg", ".jpeg")):
+            mime = "image/jpeg"
+        elif lower.endswith(".webp"):
+            mime = "image/webp"
+        elif lower.endswith(".gif"):
+            mime = "image/gif"
+        else:
+            mime = "image/png"
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    except Exception:
+        return None
+
+
+def _upsert_deleted_post_log_entry(store: Dict[str, Dict[str, Dict[str, Any]]], handle: str, entry: Dict[str, Any]) -> None:
+    by_tweet = store.setdefault(handle, {})
+    existing = by_tweet.get(entry["tweetId"])
+    existing_at = existing.get("deletedAt", "") if existing else ""
+    incoming_at = entry.get("deletedAt") or ""
+    if existing is None or incoming_at >= existing_at:
+        by_tweet[entry["tweetId"]] = entry
+
+
+def _read_browser_runner_deletions(path: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    deleted_by_handle: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return deleted_by_handle
+    for line in lines:
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        try:
+            entry = json.loads(trimmed)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("action") != "delete" or entry.get("status") != "success" or entry.get("verified") is False:
+            continue
+        handle = entry.get("handle").strip() if isinstance(entry.get("handle"), str) else ""
+        tweet_id = entry.get("tweetId").strip() if isinstance(entry.get("tweetId"), str) and entry.get("tweetId").strip() else _extract_tweet_id_from_url(entry.get("tweetUrl"))
+        if not handle or not tweet_id:
+            continue
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        _upsert_deleted_post_log_entry(
+            deleted_by_handle,
+            handle,
+            {
+                "tweetId": tweet_id,
+                "url": entry.get("tweetUrl").strip() if isinstance(entry.get("tweetUrl"), str) and entry.get("tweetUrl").strip() else f"https://x.com/{handle}/status/{tweet_id}",
+                "deletedAt": entry.get("at") if isinstance(entry.get("at"), str) else None,
+                "detectedAt": entry.get("excludedDetectedAt") if isinstance(entry.get("excludedDetectedAt"), str) else None,
+                "status": _normalize_deleted_status(entry.get("historyStatus")),
+                "thumbnailPath": _pick_thumbnail_path([
+                    evidence.get("revealed"),
+                    evidence.get("warningLabeled"),
+                    evidence.get("before"),
+                ]),
+            },
+        )
+    return deleted_by_handle
+
+
+def _read_auto_clean_deletions(path: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    deleted_by_handle: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return deleted_by_handle
+    for line in lines:
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        try:
+            entry = json.loads(trimmed)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+        if result.get("status") != "success" or result.get("actionType") != "delete_post":
+            continue
+        handle = entry.get("handle").strip() if isinstance(entry.get("handle"), str) else ""
+        tweet_id = entry.get("tweetId").strip() if isinstance(entry.get("tweetId"), str) and entry.get("tweetId").strip() else _extract_tweet_id_from_url(entry.get("url"))
+        if not handle or not tweet_id:
+            continue
+        _upsert_deleted_post_log_entry(
+            deleted_by_handle,
+            handle,
+            {
+                "tweetId": tweet_id,
+                "url": entry.get("url").strip() if isinstance(entry.get("url"), str) and entry.get("url").strip() else f"https://x.com/{handle}/status/{tweet_id}",
+                "deletedAt": result.get("finishedAt") if isinstance(result.get("finishedAt"), str) else None,
+                "detectedAt": entry.get("firstDetectedAt") if isinstance(entry.get("firstDetectedAt"), str) else None,
+                "status": _normalize_deleted_status(entry.get("detectionStatus")),
+                "thumbnailPath": _pick_thumbnail_path([result.get("screenshotPath")]),
+            },
+        )
+    return deleted_by_handle
+
+
+def _merge_deleted_post_logs(*sources: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    merged: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for source in sources:
+        for handle, entries in source.items():
+            for entry in entries.values():
+                _upsert_deleted_post_log_entry(merged, handle, entry)
+    return merged
+
+
+def _latest_transition_at(post: Dict[str, Any]) -> Optional[str]:
+    transitions = post.get("transitions") if isinstance(post.get("transitions"), list) else []
+    values = [transition.get("at") for transition in transitions if isinstance(transition, dict) and isinstance(transition.get("at"), str)]
+    values.sort()
+    return values[-1] if values else None
+
+
+def _resolve_post_recency(post: Dict[str, Any]) -> str:
+    return post.get("lastObservedAt") or _latest_transition_at(post) or post.get("firstSeen") or ""
+
+
+def _is_currently_deleted(post: Dict[str, Any], deleted_tweet_ids: Optional[set]) -> bool:
+    if post.get("currentDeleted") is True:
+        return True
+    if not deleted_tweet_ids:
+        return False
+    tweet_id = _extract_tweet_id_from_url(post.get("url"))
+    return bool(tweet_id and tweet_id in deleted_tweet_ids)
+
+
+def _select_investigated_posts(
+    posts: List[Dict[str, Any]],
+    last_checked_at: Optional[str],
+    last_observed_tweet_ids: Any,
+    deleted_tweet_ids: Optional[set],
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    non_deleted = [post for post in posts if isinstance(post, dict) and not _is_currently_deleted(post, deleted_tweet_ids)]
+    observed_ids = {tweet_id for tweet_id in (last_observed_tweet_ids if isinstance(last_observed_tweet_ids, list) else []) if isinstance(tweet_id, str) and tweet_id}
+    explicitly_observed = [
+        post for post in non_deleted
+        if observed_ids and _extract_tweet_id_from_url(post.get("url")) in observed_ids
+    ]
+    latest_observed = [
+        post for post in non_deleted
+        if not last_checked_at or post.get("lastObservedAt") == last_checked_at
+    ]
+    source_posts = explicitly_observed or latest_observed or non_deleted
+    return sorted(source_posts, key=_resolve_post_recency, reverse=True)[:limit]
+
+
+def _collect_excluded_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for post in posts:
+        status = post.get("currentStatus")
+        if status in ("excluded", "source_excluded"):
+            result.append({
+                "url": post.get("url", ""),
+                "status": status,
+                "detectedAt": post.get("firstExcluded") or post.get("lastObservedAt") or _latest_transition_at(post),
+            })
+    return result
+
+
+def _compute_post_stats(posts: List[Dict[str, Any]]) -> Dict[str, int]:
+    excluded = 0
+    sensitive = 0
+    ok_count = 0
+    for post in posts:
+        is_excluded = post.get("currentStatus") in ("excluded", "source_excluded")
+        is_sensitive = post.get("currentSensitive") is True
+        if is_excluded:
+            excluded += 1
+        if is_sensitive:
+            sensitive += 1
+        if not is_excluded and not is_sensitive:
+            ok_count += 1
+    return {"total": len(posts), "okCount": ok_count, "excluded": excluded, "sensitive": sensitive}
+
+
+def _collect_sensitive_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "url": post.get("url", ""),
+            "detectedAt": post.get("firstSensitive") or post.get("lastObservedAt") or _latest_transition_at(post),
+        }
+        for post in posts
+        if post.get("currentSensitive") is True
+    ]
+
+
+def _collect_deleted_posts(posts: List[Dict[str, Any]], deleted_entries_by_tweet_id: Optional[Dict[str, Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if not deleted_entries_by_tweet_id:
+        return []
+    posts_by_tweet_id = {
+        tweet_id: post
+        for post in posts
+        for tweet_id in [_extract_tweet_id_from_url(post.get("url"))]
+        if tweet_id
+    }
+    entries = sorted(
+        deleted_entries_by_tweet_id.values(),
+        key=lambda entry: entry.get("deletedAt") or "",
+        reverse=True,
+    )[:MAX_DELETED_THUMBNAILS_PER_ACCOUNT]
+    result: List[Dict[str, Any]] = []
+    for entry in entries:
+        post = posts_by_tweet_id.get(entry.get("tweetId"))
+        result.append({
+            "url": entry.get("url") or (post.get("url") if post else None) or f"https://x.com/i/status/{entry.get('tweetId')}",
+            "status": entry.get("status") if entry.get("status") != "unknown" else _normalize_deleted_status(post.get("currentStatus") if post else None),
+            "detectedAt": entry.get("detectedAt") or (post.get("firstExcluded") if post else None) or (post.get("lastObservedAt") if post else None) or (_latest_transition_at(post) if post else None),
+            "deletedAt": entry.get("deletedAt") or (post.get("deletedAt") if post else None),
+            "thumbnailDataUrl": _file_path_to_data_url(entry.get("thumbnailPath")),
+        })
+    return result
+
+
+def _to_jst_day_key(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone(timedelta(hours=9))).date().isoformat()
+    except Exception:
+        return None
+
+
+def _shift_jst_day_key(day_key: str, delta_days: int) -> str:
+    parsed = datetime.strptime(day_key, "%Y-%m-%d").date()
+    return (parsed + timedelta(days=delta_days)).isoformat()
+
+
+def _normalize_follower_snapshots_by_jst_day(snapshots: Any) -> List[Dict[str, Any]]:
+    if not isinstance(snapshots, list):
+        return []
+    sorted_snapshots = sorted(
+        [
+            entry for entry in snapshots
+            if isinstance(entry, dict)
+            and isinstance(entry.get("at"), str)
+            and isinstance(entry.get("count"), (int, float))
+            and not isinstance(entry.get("count"), bool)
+            and entry.get("count") >= 0
+        ],
+        key=lambda entry: entry.get("at"),
+    )
+    by_day: Dict[str, Dict[str, Any]] = {}
+    for entry in sorted_snapshots:
+        day_key = _to_jst_day_key(entry.get("at"))
+        if day_key:
+            by_day[day_key] = {"at": entry.get("at"), "count": entry.get("count")}
+    return [entry for _, entry in sorted(by_day.items(), key=lambda item: item[0])]
+
+
+def _follower_direction(delta: Optional[float]) -> str:
+    if delta is None:
+        return "unknown"
+    if delta > 0:
+        return "up"
+    if delta < 0:
+        return "down"
+    return "flat"
+
+
+def _summarize_follower_trend(account: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    followers = account.get("followers") if isinstance(account, dict) and isinstance(account.get("followers"), dict) else {}
+    normalized = _normalize_follower_snapshots_by_jst_day(followers.get("snapshots"))
+    latest_point = normalized[-1] if normalized else None
+    latest_day_key = _to_jst_day_key(latest_point.get("at")) if latest_point else None
+    if latest_day_key:
+        start_day = _shift_jst_day_key(latest_day_key, -7)
+        points = [
+            entry for entry in normalized
+            for day_key in [_to_jst_day_key(entry.get("at"))]
+            if day_key and start_day <= day_key <= latest_day_key
+        ]
+    else:
+        points = normalized[-8:]
+
+    points_by_day = {
+        day_key: entry
+        for entry in points
+        for day_key in [_to_jst_day_key(entry.get("at"))]
+        if day_key
+    }
+    previous_day_point = points_by_day.get(_shift_jst_day_key(latest_day_key, -1)) if latest_day_key else None
+    seven_day_start_point = points_by_day.get(_shift_jst_day_key(latest_day_key, -7)) if latest_day_key else None
+    current = latest_point.get("count") if latest_point else followers.get("current")
+    current = current if isinstance(current, (int, float)) and not isinstance(current, bool) else None
+    previous_day = previous_day_point.get("count") if previous_day_point else None
+    seven_day_start = seven_day_start_point.get("count") if seven_day_start_point else None
+    day_delta = current - previous_day if isinstance(current, (int, float)) and isinstance(previous_day, (int, float)) else None
+    seven_day_delta = current - seven_day_start if isinstance(current, (int, float)) and isinstance(seven_day_start, (int, float)) else None
+    return {
+        "current": current,
+        "previous": previous_day if isinstance(previous_day, (int, float)) else None,
+        "delta": day_delta,
+        "direction": _follower_direction(day_delta),
+        "previousDay": previous_day if isinstance(previous_day, (int, float)) else None,
+        "dayDelta": day_delta,
+        "dayDirection": _follower_direction(day_delta),
+        "sevenDayStart": seven_day_start if isinstance(seven_day_start, (int, float)) else None,
+        "sevenDayDelta": seven_day_delta,
+        "sevenDayDirection": _follower_direction(seven_day_delta),
+        "lastUpdatedAt": (latest_point.get("at") if latest_point else None) or followers.get("lastObservedAt"),
+        "points": points,
+    }
+
+
+def _bool_or_none(value: Any) -> Optional[bool]:
+    return value if isinstance(value, bool) else None
+
+
+def read_openclaw_shadowban_status() -> Dict[str, Any]:
+    shadowban_dir = _resolve_openclaw_shadowban_dir()
+    config = _read_json_file(os.path.join(shadowban_dir, "config.json")) or {}
+    history = _read_json_file(os.path.join(shadowban_dir, "history.json")) or {}
+    deleted_posts_by_handle = _merge_deleted_post_logs(
+        _read_browser_runner_deletions(os.path.join(shadowban_dir, "browser-runner-actions.jsonl")),
+        _read_auto_clean_deletions(os.path.join(shadowban_dir, "auto-clean-actions.jsonl")),
+    )
+
+    config_accounts = config.get("accounts") if isinstance(config.get("accounts"), list) else []
+    history_accounts = history.get("accounts") if isinstance(history.get("accounts"), dict) else {}
+    latest_check: Optional[str] = None
+    accounts: List[Dict[str, Any]] = []
+
+    for account_config in config_accounts:
+        if not isinstance(account_config, dict):
+            continue
+        handle = account_config.get("handle").strip() if isinstance(account_config.get("handle"), str) else ""
+        if not handle:
+            continue
+        name = account_config.get("name") if isinstance(account_config.get("name"), str) else handle
+        account = history_accounts.get(handle) if isinstance(history_accounts.get(handle), dict) else None
+        posts_source = account.get("posts") if account and isinstance(account.get("posts"), dict) else {}
+        all_posts = [post for post in posts_source.values() if isinstance(post, dict)]
+        deleted_entries = deleted_posts_by_handle.get(handle)
+        deleted_tweet_ids = set(deleted_entries.keys()) if deleted_entries else set()
+        last_check = account.get("lastCheck") if account and isinstance(account.get("lastCheck"), dict) else None
+        last_check_at = last_check.get("at") if last_check and isinstance(last_check.get("at"), str) else None
+        current_posts = _select_investigated_posts(
+            all_posts,
+            last_check_at,
+            account.get("lastObservedTweetIds") if account else None,
+            deleted_tweet_ids,
+            20,
+        )
+        common = {
+            "handle": handle,
+            "name": name,
+            "postStats": _compute_post_stats(current_posts),
+            "excludedPosts": _collect_excluded_posts(current_posts),
+            "deletedPosts": _collect_deleted_posts(all_posts, deleted_entries),
+            "sensitivePosts": _collect_sensitive_posts(current_posts),
+            "followers": _summarize_follower_trend(account),
+        }
+        if not last_check:
+            accounts.append({
+                **common,
+                "lastCheckedAt": None,
+                "bans": {
+                    "searchSuggestionBan": None,
+                    "searchBan": None,
+                    "ghostBan": None,
+                    "replyDeboosting": None,
+                },
+                "banCount": 0,
+                "status": "unknown",
+            })
+            continue
+
+        if last_check_at and (latest_check is None or last_check_at > latest_check):
+            latest_check = last_check_at
+        bans = {
+            "searchSuggestionBan": _bool_or_none(last_check.get("searchSuggestionBan")),
+            "searchBan": _bool_or_none(last_check.get("searchBan")),
+            "ghostBan": _bool_or_none(last_check.get("ghostBan")),
+            "replyDeboosting": _bool_or_none(last_check.get("replyDeboosting")),
+        }
+        detected_source = last_check.get("banDetectedAt") if isinstance(last_check.get("banDetectedAt"), dict) else {}
+        ban_detected_at = {
+            key: detected_source.get(key) if isinstance(detected_source.get(key), str) else (last_check_at if bans[key] is True else None)
+            for key in bans
+        }
+        ban_count = sum(1 for value in bans.values() if value is True)
+        status = "error" if ban_count >= 2 else "warn" if ban_count >= 1 else "ok"
+        accounts.append({
+            **common,
+            "lastCheckedAt": last_check_at,
+            "bans": bans,
+            "banDetectedAt": ban_detected_at,
+            "banCount": ban_count,
+            "status": status,
+        })
+
+    if any(account.get("status") == "error" for account in accounts):
+        overall_status = "error"
+    elif any(account.get("status") == "warn" for account in accounts):
+        overall_status = "warn"
+    elif all(account.get("status") == "unknown" for account in accounts):
+        overall_status = "unknown"
+    else:
+        overall_status = "ok"
+
+    return {"accounts": accounts, "overallStatus": overall_status, "lastCheckedAt": latest_check}
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -682,6 +1197,41 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    async def _handle_mission_control_redirect(self, request: "web.Request") -> "web.StreamResponse":
+        """Redirect the friendly Mission Control entry point to the Hermes UI mount."""
+        raise web.HTTPFound("/plugins/hermes-mc/")
+
+    async def _handle_hermes_mission_control_static(self, request: "web.Request") -> "web.StreamResponse":
+        """Serve the copied Hermes Mission Control static build, when configured."""
+        ui_dir = os.getenv("HERMES_MISSION_CONTROL_UI_DIR", "").strip()
+        if not ui_dir:
+            return web.json_response(
+                {"error": {"message": "Hermes Mission Control UI is not configured", "code": "mission_control_ui_not_configured"}},
+                status=404,
+            )
+
+        root = os.path.realpath(os.path.abspath(os.path.expanduser(ui_dir)))
+        index_path = os.path.realpath(os.path.join(root, "index.html"))
+        if not os.path.isfile(index_path) or os.path.commonpath([root, index_path]) != root:
+            return web.json_response(
+                {"error": {"message": "Hermes Mission Control UI build not found", "code": "mission_control_ui_not_found"}},
+                status=404,
+            )
+
+        tail = request.match_info.get("tail", "") or ""
+        tail = tail.lstrip("/")
+        candidate = os.path.realpath(os.path.join(root, tail)) if tail else index_path
+        if os.path.commonpath([root, candidate]) != root:
+            return web.json_response({"error": {"message": "Invalid path", "code": "invalid_path"}}, status=400)
+
+        if os.path.isfile(candidate):
+            return web.FileResponse(candidate)
+
+        if not tail or "." not in os.path.basename(tail):
+            return web.FileResponse(index_path)
+
+        return web.json_response({"error": {"message": "Not found", "code": "not_found"}}, status=404)
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1967,6 +2517,366 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # Hermes Mission Control proposals API
+    # ------------------------------------------------------------------
+
+    _PROPOSAL_ID_RE = __import__("re").compile(r"[A-Za-z0-9._:-]{1,180}")
+    _PROPOSAL_STATUSES = {"pending", "approved", "rejected", "executing", "cancelled", "completed", "failed"}
+    _PROPOSAL_RISK_LEVELS = {"auto", "low", "high"}
+    _MAX_PROPOSAL_FILES = 200
+
+    @staticmethod
+    def _proposal_state_path() -> str:
+        return os.path.expanduser(
+            os.getenv(
+                "HERMES_PROPOSAL_STATE_PATH",
+                _default_hermes_state_path("mission-control", "proposal-state.json"),
+            )
+        )
+
+    @staticmethod
+    def _resolve_hermes_proposal_dirs() -> List[str]:
+        configured_dirs = os.getenv("HERMES_PROPOSALS_DIRS", "").strip()
+        candidates: List[str] = []
+        if configured_dirs:
+            candidates.extend(item.strip() for item in configured_dirs.split(os.pathsep) if item.strip())
+
+        configured_dir = os.getenv("HERMES_PROPOSALS_DIR", "").strip()
+        if configured_dir:
+            candidates.append(configured_dir)
+
+        candidates.extend(
+            [
+                "/mnt/c/Users/Slowlife/.openclaw/workspace/proposals",
+                _default_hermes_state_path("proposals"),
+                os.path.expanduser("~/.hermes/proposals"),
+            ]
+        )
+
+        resolved: List[str] = []
+        seen = set()
+        for candidate in candidates:
+            path = os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+            if path in seen or not os.path.isdir(path):
+                continue
+            seen.add(path)
+            resolved.append(path)
+        return resolved
+
+    @classmethod
+    def _load_hermes_proposal_state(cls) -> Dict[str, Dict[str, Any]]:
+        path = cls._proposal_state_path()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            logger.exception("Failed to load Hermes proposal state: %s", path)
+            return {}
+
+        proposals = payload.get("proposals") if isinstance(payload, dict) else None
+        if not isinstance(proposals, dict):
+            return {}
+        return {
+            str(proposal_id): state
+            for proposal_id, state in proposals.items()
+            if isinstance(state, dict)
+        }
+
+    @classmethod
+    def _save_hermes_proposal_state(cls, proposals: Dict[str, Dict[str, Any]]) -> None:
+        path = cls._proposal_state_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        payload = {
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+            "proposals": proposals,
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, path)
+
+    @classmethod
+    def _set_hermes_proposal_state(
+        cls,
+        proposal_id: str,
+        status: str,
+        *,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        proposals = cls._load_hermes_proposal_state()
+        now_ms = int(time.time() * 1000)
+        entry = dict(proposals.get(proposal_id, {}))
+        entry["status"] = status
+        entry["updatedAt"] = now_ms
+        if reason:
+            entry["reason"] = reason[:2000]
+        proposals[proposal_id] = entry
+        cls._save_hermes_proposal_state(proposals)
+        return entry
+
+    @staticmethod
+    def _parse_proposal_timestamp_ms(value: Any) -> Optional[int]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            return int(number if number > 10_000_000_000 else number * 1000)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        text = value.strip()
+        try:
+            number = float(text)
+            return int(number if number > 10_000_000_000 else number * 1000)
+        except Exception:
+            pass
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bounded_markdown_text(value: str, *, max_len: int = 4000) -> str:
+        cleaned = re.sub(r"\n{3,}", "\n\n", value.strip())
+        return cleaned[:max_len]
+
+    @classmethod
+    def _extract_markdown_sections(cls, text: str) -> Dict[str, str]:
+        matches = list(re.finditer(r"^##\s+(.+?)\s*$", text, flags=re.MULTILINE))
+        sections: Dict[str, str] = {}
+        for index, match in enumerate(matches):
+            title = match.group(1).strip().lower()
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            sections[title] = cls._bounded_markdown_text(text[start:end])
+        return sections
+
+    @staticmethod
+    def _extract_proposal_metadata(text: str) -> Dict[str, str]:
+        metadata: Dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                break
+            match = re.match(r"^([A-Za-z][A-Za-z0-9 _-]{0,40}):\s*(.+?)\s*$", stripped)
+            if match:
+                metadata[match.group(1).strip().lower()] = match.group(2).strip()
+        return metadata
+
+    @classmethod
+    def _first_markdown_paragraph(cls, text: str) -> str:
+        lines: List[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                if lines:
+                    break
+                continue
+            if line.startswith("#") or re.match(r"^[A-Za-z][A-Za-z0-9 _-]{0,40}:\s+", line):
+                continue
+            lines.append(line)
+        return cls._bounded_markdown_text(" ".join(lines), max_len=1200)
+
+    @staticmethod
+    def _proposal_domain_from_category(category: str) -> str:
+        normalized = category.strip().lower()
+        if normalized in {"music", "audio", "release"}:
+            return "domain-music"
+        if normalized in {"sns", "social", "marketing", "content"}:
+            return "domain-sns"
+        if normalized in {"mail", "email", "inbox"}:
+            return "domain-mail"
+        if normalized in {"schedule", "calendar"}:
+            return "domain-schedule"
+        if normalized in {"finance", "billing", "business", "strategy"}:
+            return "domain-management"
+        return "domain-ops"
+
+    @classmethod
+    def _parse_hermes_proposal_file(
+        cls,
+        path: str,
+        state_by_id: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        proposal_id = os.path.splitext(os.path.basename(path))[0]
+        if not cls._PROPOSAL_ID_RE.fullmatch(proposal_id):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except Exception:
+            logger.exception("Failed to read Hermes proposal file: %s", path)
+            return None
+
+        title_match = re.search(r"^#\s+(.+?)\s*$", text, flags=re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else proposal_id
+        metadata = cls._extract_proposal_metadata(text)
+        sections = cls._extract_markdown_sections(text)
+        state = state_by_id.get(proposal_id, {})
+
+        status = state.get("status") if isinstance(state.get("status"), str) else "pending"
+        if status not in cls._PROPOSAL_STATUSES:
+            status = "pending"
+        generated_at = metadata.get("generated") or metadata.get("created")
+        mtime_ms = int(os.path.getmtime(path) * 1000)
+        created_at = cls._parse_proposal_timestamp_ms(generated_at) or mtime_ms
+        updated_at = cls._parse_proposal_timestamp_ms(state.get("updatedAt")) or mtime_ms
+        requires_approval = sections.get("requires explicit approval before", "").strip()
+        risk_level = "high" if requires_approval else "low"
+        if risk_level not in cls._PROPOSAL_RISK_LEVELS:
+            risk_level = "low"
+
+        proposal_text = (
+            sections.get("proposal")
+            or sections.get("first safe step")
+            or cls._first_markdown_paragraph(text)
+            or "Review this Hermes Agent proposal."
+        )
+        rationale = sections.get("why now") or metadata.get("safety") or ""
+        first_step = sections.get("first safe step") or "Review the local proposal file."
+        category = metadata.get("category", "")
+
+        return {
+            "id": proposal_id,
+            "title": cls._bounded_markdown_text(title, max_len=240),
+            "description": cls._bounded_markdown_text(proposal_text),
+            "rationale": cls._bounded_markdown_text(rationale),
+            "riskLevel": risk_level,
+            "status": status,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+            "sourceSessionKey": f"hermes-agent:proposal:{proposal_id}",
+            "domainId": cls._proposal_domain_from_category(category),
+            "actions": [
+                {
+                    "type": "review",
+                    "description": cls._bounded_markdown_text(first_step, max_len=1000),
+                }
+            ],
+        }
+
+    @classmethod
+    def _load_hermes_proposals(cls, *, limit: int) -> List[Dict[str, Any]]:
+        state_by_id = cls._load_hermes_proposal_state()
+        proposals: List[Dict[str, Any]] = []
+        seen = set()
+        for directory in cls._resolve_hermes_proposal_dirs():
+            try:
+                entries = [
+                    os.path.join(directory, name)
+                    for name in os.listdir(directory)
+                    if name.lower().endswith(".md")
+                ]
+            except Exception:
+                logger.exception("Failed to list Hermes proposal directory: %s", directory)
+                continue
+            entries.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+            for path in entries[: cls._MAX_PROPOSAL_FILES]:
+                proposal_id = os.path.splitext(os.path.basename(path))[0]
+                if proposal_id in seen:
+                    continue
+                proposal = cls._parse_hermes_proposal_file(path, state_by_id)
+                if proposal:
+                    seen.add(proposal_id)
+                    proposals.append(proposal)
+        proposals.sort(key=lambda item: item.get("updatedAt", 0), reverse=True)
+        return proposals[: max(1, min(limit, cls._MAX_PROPOSAL_FILES))]
+
+    @classmethod
+    def _proposal_stats(cls, proposals: List[Dict[str, Any]]) -> Dict[str, int]:
+        stats = {
+            "total": 0,
+            "pending": 0,
+            "approved": 0,
+            "executing": 0,
+            "cancelled": 0,
+            "completed": 0,
+            "rejected": 0,
+            "failed": 0,
+        }
+        for proposal in proposals:
+            stats["total"] += 1
+            status = proposal.get("status")
+            if status in stats:
+                stats[status] += 1
+        return stats
+
+    @classmethod
+    def _find_hermes_proposal_file(cls, proposal_id: str) -> Optional[str]:
+        for directory in cls._resolve_hermes_proposal_dirs():
+            path = os.path.realpath(os.path.join(directory, f"{proposal_id}.md"))
+            root = os.path.realpath(directory)
+            if not (path == root or path.startswith(root + os.sep)):
+                continue
+            if os.path.isfile(path):
+                return path
+        return None
+
+    async def _handle_list_mission_control_proposals(self, request: "web.Request") -> "web.Response":
+        """GET /api/mission-control/proposals — list local Hermes Agent proposals."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except Exception:
+            limit = 100
+        try:
+            proposals = self._load_hermes_proposals(limit=limit)
+            return web.json_response(
+                {
+                    "source": "hermes-agent",
+                    "proposals": proposals,
+                    "stats": self._proposal_stats(proposals),
+                }
+            )
+        except Exception as e:
+            logger.exception("Failed to list Hermes Mission Control proposals")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_resolve_mission_control_proposal(self, request: "web.Request") -> "web.Response":
+        """POST /api/mission-control/proposals/{proposal_id}/resolve — record local review state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        proposal_id = request.match_info["proposal_id"]
+        if not self._PROPOSAL_ID_RE.fullmatch(proposal_id):
+            return web.json_response({"error": "Invalid proposal ID"}, status=400)
+        if not self._find_hermes_proposal_file(proposal_id):
+            return web.json_response({"error": "Proposal not found"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        decision = body.get("decision")
+        if decision not in {"approved", "rejected"}:
+            return web.json_response({"error": "Decision must be approved or rejected"}, status=400)
+        reason = body.get("reason") if isinstance(body.get("reason"), str) else None
+        state = self._set_hermes_proposal_state(proposal_id, decision, reason=reason)
+        return web.json_response({"ok": True, "id": proposal_id, "state": state})
+
+    async def _handle_cancel_mission_control_proposal(self, request: "web.Request") -> "web.Response":
+        """POST /api/mission-control/proposals/{proposal_id}/cancel — record local cancellation state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        proposal_id = request.match_info["proposal_id"]
+        if not self._PROPOSAL_ID_RE.fullmatch(proposal_id):
+            return web.json_response({"error": "Invalid proposal ID"}, status=400)
+        if not self._find_hermes_proposal_file(proposal_id):
+            return web.json_response({"error": "Proposal not found"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = body.get("reason") if isinstance(body.get("reason"), str) else None
+        state = self._set_hermes_proposal_state(proposal_id, "cancelled", reason=reason)
+        return web.json_response({"ok": True, "id": proposal_id, "state": state})
+
+    # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
@@ -1975,6 +2885,244 @@ class APIServerAdapter(BasePlatformAdapter):
     _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
+
+    @staticmethod
+    def _safe_str(value: Any, *, max_len: int = 500) -> str:
+        """Return bounded text only for actual strings; never stringify objects."""
+        if not isinstance(value, str):
+            return ""
+        return value[:max_len]
+
+    @classmethod
+    def _safe_optional_int(cls, value: Any) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @classmethod
+    def _safe_openclaw_schedule(cls, value: Any) -> Optional[Dict[str, Any]]:
+        """Allowlist primitive schedule shapes for UI display only."""
+        if not isinstance(value, dict):
+            return None
+        kind = cls._safe_str(value.get("kind"), max_len=20)
+        if kind == "cron":
+            expr = cls._safe_str(value.get("expr"), max_len=120)
+            tz = cls._safe_str(value.get("tz"), max_len=80)
+            if not expr:
+                return None
+            result: Dict[str, Any] = {"kind": "cron", "expr": expr}
+            if tz:
+                result["tz"] = tz
+            return result
+        if kind == "at":
+            at = cls._safe_str(value.get("at"), max_len=80)
+            return {"kind": "at", "at": at} if at else None
+        if kind == "every":
+            every_ms = cls._safe_optional_int(value.get("everyMs"))
+            return {"kind": "every", "everyMs": every_ms} if every_ms and every_ms > 0 else None
+        return None
+
+    @classmethod
+    def _sanitize_openclaw_import_candidate(cls, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a UI-safe OpenClaw import candidate without prompts or secrets."""
+        create_candidate = candidate.get("hermes_cron_create_candidate")
+        if not isinstance(create_candidate, dict):
+            create_candidate = {}
+        source_meta = candidate.get("source_metadata_redacted")
+        if not isinstance(source_meta, dict):
+            source_meta = {}
+        risk_tag_source = candidate.get("risk_tags")
+        if not isinstance(risk_tag_source, list):
+            risk_tag_source = []
+        enabled_toolset_source = create_candidate.get("enabled_toolsets")
+        if not isinstance(enabled_toolset_source, list):
+            enabled_toolset_source = []
+        risk_tags = [tag for tag in risk_tag_source if isinstance(tag, str)]
+        enabled_toolsets = [toolset for toolset in enabled_toolset_source if isinstance(toolset, str)]
+        return {
+            "source": "openclaw",
+            "sourceJobId": cls._safe_str(candidate.get("source_job_id"), max_len=120),
+            "sourceName": cls._safe_str(candidate.get("source_name"), max_len=200),
+            "status": cls._safe_str(candidate.get("status") or "not-created", max_len=80),
+            "activation": cls._safe_str(candidate.get("activation"), max_len=160),
+            "recommendedInitialMode": cls._safe_str(
+                candidate.get("recommended_initial_mode") or "dry-run-report-only",
+                max_len=120,
+            ),
+            "manualReviewRequired": bool(candidate.get("manual_review_required", True)),
+            "riskTags": [cls._safe_str(tag, max_len=80) for tag in risk_tags[:20]],
+            "hermesCandidate": {
+                "name": cls._safe_str(create_candidate.get("name"), max_len=200),
+                "schedule": cls._safe_str(create_candidate.get("schedule"), max_len=120),
+                "deliver": cls._safe_str(create_candidate.get("deliver"), max_len=80),
+                "repeat": cls._safe_optional_int(create_candidate.get("repeat")),
+                "enabledToolsets": [cls._safe_str(toolset, max_len=80) for toolset in enabled_toolsets[:20]],
+                "promptRedacted": True,
+            },
+            "sourceMetadata": {
+                "enabledInOpenClaw": bool(source_meta.get("enabled_in_openclaw")),
+                "payloadKind": cls._safe_str(source_meta.get("payload_kind"), max_len=80),
+                "schedule": cls._safe_openclaw_schedule(source_meta.get("schedule")),
+                "lastRunStatus": cls._safe_str(source_meta.get("last_run_status"), max_len=80),
+                "nextRunAtMs": cls._safe_optional_int(source_meta.get("next_run_at_ms")),
+                "consecutiveErrors": cls._safe_optional_int(source_meta.get("consecutive_errors")),
+                "deliveryMode": cls._safe_str(source_meta.get("delivery_mode"), max_len=80),
+                "deliveryChannelPresent": bool(source_meta.get("delivery_channel_present")),
+            },
+        }
+
+    @staticmethod
+    def _openclaw_source_job_id_from_prompt(prompt: Any) -> Optional[str]:
+        """Extract the non-secret migration marker from a Hermes cron prompt."""
+        if not isinstance(prompt, str):
+            return None
+        match = re.search(r"^OpenClaw-Source-Job-ID:\s*(.+?)\s*$", prompt[:2000], re.MULTILINE)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _load_openclaw_enabled_by_id() -> Dict[str, bool]:
+        """Best-effort live OpenClaw enabled-state map for UI display only."""
+        jobs_path = os.path.realpath(os.path.abspath(OPENCLAW_CRON_JOBS_PATH))
+        if not os.path.isfile(jobs_path):
+            return {}
+        with open(jobs_path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw_jobs = raw.get("jobs") if isinstance(raw, dict) else []
+        if not isinstance(raw_jobs, list):
+            return {}
+        enabled_by_id: Dict[str, bool] = {}
+        for job in raw_jobs:
+            if not isinstance(job, dict):
+                continue
+            source_id = job.get("id")
+            if isinstance(source_id, str) and source_id:
+                enabled_by_id[source_id] = bool(job.get("enabled") is not False)
+        return enabled_by_id
+
+    @staticmethod
+    def _openclaw_import_summary(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        by_status: Dict[str, int] = {}
+        by_risk_tag: Dict[str, int] = {}
+        for candidate in candidates:
+            status = str(candidate.get("status") or "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+            for tag in candidate.get("riskTags") or []:
+                by_risk_tag[tag] = by_risk_tag.get(tag, 0) + 1
+        return {
+            "total": len(candidates),
+            "byStatus": by_status,
+            "byRiskTag": by_risk_tag,
+        }
+
+    async def _handle_openclaw_shadowban_status(self, request: "web.Request") -> "web.Response":
+        """GET /api/openclaw/shadowban-status — OpenClaw Mission Control-compatible shadowban summary."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            return web.json_response(read_openclaw_shadowban_status())
+        except Exception:
+            logger.exception("Failed to build OpenClaw shadowban status response")
+            return web.json_response(
+                {"error": "OpenClaw shadowban status is unavailable", "code": "openclaw_shadowban_status_unavailable"},
+                status=500,
+            )
+
+    async def _handle_openclaw_cron_import(self, request: "web.Request") -> "web.Response":
+        """GET /api/openclaw/cron-import — read-only, sanitized import candidates for Mission Control."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        definitions_path = os.path.realpath(os.path.abspath(OPENCLAW_CRON_IMPORT_DEFINITIONS_PATH))
+        if not os.path.isfile(definitions_path):
+            return web.json_response(
+                {
+                    "source": "openclaw",
+                    "candidates": [],
+                    "summary": {"total": 0, "byStatus": {}, "byRiskTag": {}},
+                    "error": "OpenClaw cron import definitions not found",
+                },
+                status=404,
+            )
+
+        try:
+            with open(definitions_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            raw_candidates = raw.get("candidates") if isinstance(raw, dict) else []
+            if not isinstance(raw_candidates, list):
+                raw_candidates = []
+            candidates = [
+                self._sanitize_openclaw_import_candidate(item)
+                for item in raw_candidates
+                if isinstance(item, dict)
+            ]
+            hermes_jobs: List[Dict[str, Any]] = []
+            if _CRON_AVAILABLE:
+                try:
+                    hermes_jobs = _cron_list(include_disabled=True) or []
+                except Exception as e:
+                    logger.debug("Could not load Hermes cron jobs for OpenClaw import matching: %s", e)
+            hermes_jobs_by_openclaw_source_id: Dict[str, Dict[str, Any]] = {}
+            for job in hermes_jobs:
+                if not isinstance(job, dict):
+                    continue
+                source_job_id = self._openclaw_source_job_id_from_prompt(job.get("prompt"))
+                if source_job_id and source_job_id not in hermes_jobs_by_openclaw_source_id:
+                    hermes_jobs_by_openclaw_source_id[source_job_id] = job
+
+            openclaw_enabled_by_id: Dict[str, bool] = {}
+            try:
+                openclaw_enabled_by_id = self._load_openclaw_enabled_by_id()
+            except Exception as e:
+                logger.debug("Could not load live OpenClaw cron state for import matching: %s", e)
+
+            for candidate in candidates:
+                source_job_id = str(candidate.get("sourceJobId") or "").strip()
+                # Only migration-marker matches are authoritative. Name matches can collide with
+                # ordinary Hermes jobs and would incorrectly hide an unmigrated pseudo-candidate
+                # in Mission Control.
+                matched_job = hermes_jobs_by_openclaw_source_id.get(source_job_id)
+                if source_job_id in openclaw_enabled_by_id:
+                    candidate.setdefault("sourceMetadata", {})["enabledInOpenClaw"] = openclaw_enabled_by_id[source_job_id]
+                if matched_job:
+                    matched_enabled = bool(matched_job.get("enabled"))
+                    candidate["matchedHermesJob"] = {
+                        "id": self._safe_str(matched_job.get("id"), max_len=120),
+                        "name": self._safe_str(matched_job.get("name"), max_len=200),
+                        "enabled": matched_enabled,
+                        "schedule": self._safe_openclaw_schedule(matched_job.get("schedule")),
+                    }
+                    candidate["status"] = "migrated-active" if matched_enabled else "migrated-paused"
+                    candidate["activation"] = "OpenClaw disabled; Hermes recurring job active" if matched_enabled else "OpenClaw disabled; Hermes job exists but is not active"
+                    candidate["manualReviewRequired"] = False
+                    candidate["recommendedInitialMode"] = "full-recurring-hermes"
+            generated_at = raw.get("generated_at") if isinstance(raw, dict) else None
+            return web.json_response(
+                {
+                    "source": "openclaw",
+                    "generatedAt": self._safe_str(generated_at, max_len=80),
+                    "mode": "read-only-sanitized",
+                    "candidates": candidates,
+                    "summary": self._openclaw_import_summary(candidates),
+                    "safety": {
+                        "promptsRedacted": True,
+                        "secretsRedacted": True,
+                        "readOnly": True,
+                    },
+                }
+            )
+        except json.JSONDecodeError:
+            logger.warning("Invalid OpenClaw import definitions JSON", exc_info=True)
+            return web.json_response(
+                {"error": "OpenClaw import definitions are invalid", "code": "openclaw_import_invalid_json"},
+                status=500,
+            )
+        except Exception:
+            logger.exception("Failed to build OpenClaw cron import response")
+            return web.json_response(
+                {"error": "OpenClaw import status is unavailable", "code": "openclaw_import_unavailable"},
+                status=500,
+            )
 
     @staticmethod
     def _check_jobs_available() -> Optional["web.Response"]:
@@ -2620,12 +3768,24 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/mission-control", self._handle_mission_control_redirect)
+            self._app.router.add_get("/mission-control/", self._handle_mission_control_redirect)
+            self._app.router.add_get("/plugins/hermes-mc/", self._handle_hermes_mission_control_static)
+            self._app.router.add_get("/plugins/hermes-mc/{tail:.*}", self._handle_hermes_mission_control_static)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
+            self._app.router.add_get("/api/openclaw/cron-import", self._handle_openclaw_cron_import)
+            self._app.router.add_get("/api/openclaw/shadowban-status", self._handle_openclaw_shadowban_status)
+            self._app.router.add_get("/api/shadowban/status", self._handle_openclaw_shadowban_status)
+            self._app.router.add_get("/api/mission-control/shadowban-status", self._handle_openclaw_shadowban_status)
+            self._app.router.add_get("/api/mission-control/proposals", self._handle_list_mission_control_proposals)
+            self._app.router.add_get("/api/proposals", self._handle_list_mission_control_proposals)
+            self._app.router.add_post("/api/mission-control/proposals/{proposal_id}/resolve", self._handle_resolve_mission_control_proposal)
+            self._app.router.add_post("/api/mission-control/proposals/{proposal_id}/cancel", self._handle_cancel_mission_control_proposal)
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
             self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
