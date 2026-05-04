@@ -663,6 +663,56 @@ class TestRunsEndpoint:
         assert completed_event["activity"]["phase"] == "completed"
 
     @pytest.mark.asyncio
+    async def test_run_events_include_thinking_activity_for_reasoning(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_progress_callback=None):
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "reasoning.available",
+                        preview="Inspecting the request",
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        reasoning_event = next(event for event in events if event["event"] == "reasoning.available")
+        assert reasoning_event["activity"]["schema"] == "agent.activity.v1"
+        assert reasoning_event["activity"]["stream"] == "thinking"
+        assert reasoning_event["activity"]["phase"] == "update"
+        assert reasoning_event["activity"]["runId"] == run_id
+        assert reasoning_event["activity"]["data"]["statusLine"] == "Inspecting the request"
+
+    @pytest.mark.asyncio
     async def test_run_events_merge_failed_tool_progress_metadata(self, adapter):
         class FakeAgent:
             session_prompt_tokens = 1

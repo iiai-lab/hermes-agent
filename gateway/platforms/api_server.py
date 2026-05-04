@@ -2448,12 +2448,20 @@ class APIServerAdapter(BasePlatformAdapter):
         def _progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "reasoning.available":
-                _push({
+                event = {
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
                     "text": preview or "",
-                })
+                }
+                _push(self._attach_run_activity(
+                    event,
+                    session_id=session_id,
+                    run_id=run_id,
+                    stream="thinking",
+                    phase="update",
+                    data={"statusLine": compact_display_text(preview or "Thinking")},
+                ))
             elif event_type == "tool.completed":
                 key = tool_name or "tool"
                 pending_tool_completions.setdefault(key, []).append({
