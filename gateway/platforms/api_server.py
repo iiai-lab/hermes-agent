@@ -44,6 +44,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.agent_activity import build_agent_activity_event, compact_display_text
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -2695,8 +2696,31 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+    def _attach_run_activity(
+        self,
+        event: Dict[str, Any],
+        *,
+        session_id: str,
+        run_id: str,
+        stream: str,
+        phase: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event["activity"] = build_agent_activity_event(
+            session_key=session_id,
+            run_id=run_id,
+            stream=stream,
+            phase=phase,
+            timestamp=event.get("timestamp"),
+            data=data or {},
+        )
+        return event
+
+    def _make_run_event_callbacks(self, run_id: str, session_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return run event callbacks that push structured events to the run's SSE queue."""
+        tool_started_at: Dict[str, float] = {}
+        pending_tool_completions: Dict[str, List[Dict[str, Any]]] = {}
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -2711,35 +2735,117 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        def _tool_preview(function_name: str, function_args: Any) -> str:
+            try:
+                from agent.display import build_tool_preview
+                preview = build_tool_preview(function_name, function_args)
+            except Exception:
+                preview = ""
+            if preview:
+                return compact_display_text(preview)
+            if function_args:
+                try:
+                    args_text = json.dumps(function_args, sort_keys=True, default=str)
+                except Exception:
+                    args_text = str(function_args)
+                return compact_display_text(f"{function_name} {args_text}")
+            return compact_display_text(function_name)
+
+        def _progress_callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
-            if event_type == "tool.started":
-                _push({
-                    "event": "tool.started",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "preview": preview,
-                })
-            elif event_type == "tool.completed":
-                _push({
-                    "event": "tool.completed",
-                    "run_id": run_id,
-                    "timestamp": ts,
-                    "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
-                    "error": kwargs.get("is_error", False),
-                })
-            elif event_type == "reasoning.available":
+            if event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            elif event_type == "tool.completed":
+                key = tool_name or "tool"
+                pending_tool_completions.setdefault(key, []).append({
+                    "duration": kwargs.get("duration"),
+                    "is_error": kwargs.get("is_error", False),
+                    "status": kwargs.get("status"),
+                    "error": kwargs.get("error"),
+                })
+                return
+            elif event_type == "tool.started":
+                return
             # _thinking and subagent_progress are intentionally not forwarded
 
-        return _callback
+        def _tool_start_callback(tool_call_id, function_name, function_args):
+            if not tool_call_id:
+                return
+            ts = time.time()
+            tool_started_at[tool_call_id] = ts
+            preview = _tool_preview(function_name, function_args)
+            event = {
+                "event": "tool.started",
+                "run_id": run_id,
+                "timestamp": ts,
+                "tool": function_name,
+                "preview": preview,
+            }
+            _push(self._attach_run_activity(
+                event,
+                session_id=session_id,
+                run_id=run_id,
+                stream="tool",
+                phase="start",
+                data={
+                    "toolCallId": tool_call_id,
+                    "name": function_name,
+                    "args": function_args,
+                    "partialResult": preview,
+                },
+            ))
+
+        def _tool_complete_callback(tool_call_id, function_name, function_args, function_result):
+            if not tool_call_id:
+                return
+            ts = time.time()
+            started_at = tool_started_at.pop(tool_call_id, None)
+            metadata_queue = pending_tool_completions.get(function_name or "tool") or []
+            metadata = metadata_queue.pop(0) if metadata_queue else {}
+            if not metadata_queue:
+                pending_tool_completions.pop(function_name or "tool", None)
+            metadata_duration = metadata.get("duration")
+            duration = metadata_duration
+            if duration is None and started_at is not None:
+                duration = round(ts - started_at, 3)
+            is_error = bool(metadata.get("is_error", False))
+            status = metadata.get("status") or ("failed" if is_error else "completed")
+            event = {
+                "event": "tool.completed",
+                "run_id": run_id,
+                "timestamp": ts,
+                "tool": function_name,
+                "error": is_error,
+            }
+            data = {
+                "toolCallId": tool_call_id,
+                "name": function_name,
+                "status": status,
+                "isError": is_error,
+            }
+            if duration is not None:
+                event["duration"] = duration
+                data["duration"] = duration
+            if function_result is not None:
+                data["result"] = compact_display_text(function_result)
+            error_text = metadata.get("error")
+            if error_text is not None:
+                data["error"] = compact_display_text(error_text)
+            _push(self._attach_run_activity(
+                event,
+                session_id=session_id,
+                run_id=run_id,
+                stream="tool",
+                phase="failed" if is_error else "completed",
+                data=data,
+            ))
+
+        return _progress_callback, _tool_start_callback, _tool_complete_callback
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -2828,7 +2934,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb, tool_start_cb, tool_complete_cb = self._make_run_event_callbacks(run_id, session_id, loop)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -2861,6 +2967,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
+                    tool_start_callback=tool_start_cb,
+                    tool_complete_callback=tool_complete_cb,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():
@@ -2883,12 +2991,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 # block below never fires — issue #15561).
                 if isinstance(result, dict) and result.get("failed"):
                     error_msg = result.get("error") or "agent run failed"
-                    q.put_nowait({
+                    failed_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
-                    })
+                    }
+                    q.put_nowait(self._attach_run_activity(
+                        failed_event,
+                        session_id=session_id,
+                        run_id=run_id,
+                        stream="lifecycle",
+                        phase="failed",
+                        data={
+                            "statusLine": "Session run failed",
+                            "error": compact_display_text(error_msg),
+                        },
+                    ))
                     self._set_run_status(
                         run_id,
                         "failed",
@@ -2897,13 +3016,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    q.put_nowait({
+                    completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
                         "usage": usage,
-                    })
+                    }
+                    q.put_nowait(self._attach_run_activity(
+                        completed_event,
+                        session_id=session_id,
+                        run_id=run_id,
+                        stream="lifecycle",
+                        phase="completed",
+                        data={"statusLine": "Session run completed"},
+                    ))
                     self._set_run_status(
                         run_id,
                         "completed",
@@ -2918,11 +3045,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.cancelled",
                 )
                 try:
-                    q.put_nowait({
+                    cancelled_event = {
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                    })
+                    }
+                    q.put_nowait(self._attach_run_activity(
+                        cancelled_event,
+                        session_id=session_id,
+                        run_id=run_id,
+                        stream="lifecycle",
+                        phase="cancelled",
+                        data={"statusLine": "Session run cancelled"},
+                    ))
                 except Exception:
                     pass
                 raise
@@ -2935,12 +3070,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.failed",
                 )
                 try:
-                    q.put_nowait({
+                    failed_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": str(exc),
-                    })
+                    }
+                    q.put_nowait(self._attach_run_activity(
+                        failed_event,
+                        session_id=session_id,
+                        run_id=run_id,
+                        stream="lifecycle",
+                        phase="failed",
+                        data={
+                            "statusLine": "Session run failed",
+                            "error": compact_display_text(exc),
+                        },
+                    ))
                 except Exception:
                     pass
             finally:
