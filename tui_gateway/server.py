@@ -2918,17 +2918,38 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 else:
                     run_message = _enrich_with_attached_images(prompt, images)
 
+            streamed_text = {"has_visible_text": False}
+
             def _stream(delta):
+                if not isinstance(delta, str) or not delta:
+                    return
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
+                if delta.strip():
+                    streamed_text["has_visible_text"] = True
 
-            result = agent.run_conversation(
-                run_message,
-                conversation_history=list(history),
-                stream_callback=_stream,
-            )
+            previous_interim_cb = getattr(agent, "interim_assistant_callback", None)
+
+            def _interim_assistant(text: str, *, already_streamed: bool = False):
+                if already_streamed:
+                    return
+                visible = str(text or "").strip()
+                if visible:
+                    if streamed_text["has_visible_text"]:
+                        visible = "\n\n" + visible
+                    _stream(visible)
+
+            agent.interim_assistant_callback = _interim_assistant
+            try:
+                result = agent.run_conversation(
+                    run_message,
+                    conversation_history=list(history),
+                    stream_callback=_stream,
+                )
+            finally:
+                agent.interim_assistant_callback = previous_interim_cb
 
             last_reasoning = None
             status_note = None

@@ -663,6 +663,109 @@ class TestRunsEndpoint:
         assert completed_event["activity"]["phase"] == "completed"
 
     @pytest.mark.asyncio
+    async def test_run_events_include_thinking_activity_for_reasoning(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_progress_callback=None):
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "reasoning.available",
+                        preview="Inspecting the request",
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        reasoning_event = next(event for event in events if event["event"] == "reasoning.available")
+        assert reasoning_event["activity"]["schema"] == "agent.activity.v1"
+        assert reasoning_event["activity"]["stream"] == "thinking"
+        assert reasoning_event["activity"]["phase"] == "update"
+        assert reasoning_event["activity"]["runId"] == run_id
+        assert reasoning_event["activity"]["data"]["statusLine"] == "Inspecting the request"
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_interim_assistant_message_deltas(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, interim_assistant_callback=None):
+                self.interim_assistant_callback = interim_assistant_callback
+
+            def run_conversation(self, **kwargs):
+                if self.interim_assistant_callback:
+                    self.interim_assistant_callback(
+                        "まずリポジトリを確認します。",
+                        already_streamed=False,
+                    )
+                    self.interim_assistant_callback(
+                        "次に差分を確認します。",
+                        already_streamed=False,
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("interim_assistant_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        deltas = [event["delta"] for event in events if event["event"] == "message.delta"]
+        assert deltas == [
+            "まずリポジトリを確認します。",
+            "\n\n次に差分を確認します。",
+        ]
+
+    @pytest.mark.asyncio
     async def test_run_events_merge_failed_tool_progress_metadata(self, adapter):
         class FakeAgent:
             session_prompt_tokens = 1
@@ -807,6 +910,49 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_surfaces_interim_assistant_commentary(self, adapter):
+        """Completed mid-turn assistant commentary is streamed before final completion."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("interim_assistant_callback")
+                if cb:
+                    cb("まずリポジトリを確認します。", already_streamed=False)
+                    cb("次に差分を確認します。", already_streamed=False)
+                return (
+                    {"final_response": "done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                import json as _json
+
+                content_chunks = []
+                for line in body.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = _json.loads(line[len("data: "):])
+                    content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                    if content:
+                        content_chunks.append(content)
+                assert content_chunks == [
+                    "まずリポジトリを確認します。",
+                    "\n\n次に差分を確認します。",
+                ]
+                assert body.index('"content"') < body.index('"finish_reason": "stop"')
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
