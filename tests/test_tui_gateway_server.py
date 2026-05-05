@@ -1705,6 +1705,56 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_streams_interim_assistant_commentary(monkeypatch):
+    events = []
+
+    class _Agent:
+        interim_assistant_callback = None
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            cb = getattr(self, "interim_assistant_callback", None)
+            if cb:
+                cb("まずリポジトリを確認します。", already_streamed=False)
+                cb("次に差分を確認します。", already_streamed=False)
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: events.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "ping"},
+        }
+    )
+
+    assert resp["result"]["status"] == "streaming"
+    event_names = [event[0] for event in events]
+    assert event_names.index("message.delta") < event_names.index("message.complete")
+    deltas = [event[2]["text"] for event in events if event[0] == "message.delta"]
+    assert deltas == [
+        "まずリポジトリを確認します。",
+        "\n\n次に差分を確認します。",
+    ]
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 
