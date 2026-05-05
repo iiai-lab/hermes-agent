@@ -791,6 +791,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -839,6 +840,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            interim_assistant_callback=interim_assistant_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -1076,6 +1078,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            streamed_text = {"has_visible_text": False}
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -1087,6 +1090,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 # completion via agent_task.done() instead.
                 if delta is not None:
                     _stream_q.put(delta)
+                    if isinstance(delta, str) and delta.strip():
+                        streamed_text["has_visible_text"] = True
+
+            def _on_interim_assistant(text: str, *, already_streamed: bool = False):
+                if already_streamed:
+                    return
+                visible = str(text or "").strip()
+                if not visible:
+                    return
+                if streamed_text["has_visible_text"]:
+                    visible = "\n\n" + visible
+                _stream_q.put(visible)
+                streamed_text["has_visible_text"] = True
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
@@ -1151,6 +1167,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                interim_assistant_callback=_on_interim_assistant,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
@@ -2621,6 +2638,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -2645,6 +2663,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                interim_assistant_callback=interim_assistant_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
@@ -2944,6 +2963,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         event_cb, tool_start_cb, tool_complete_cb = self._make_run_event_callbacks(run_id, session_id, loop)
 
+        run_streamed_text = {"has_visible_text": False}
+
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
@@ -2955,6 +2976,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "delta": delta,
                 })
+                if isinstance(delta, str) and delta.strip():
+                    run_streamed_text["has_visible_text"] = True
+            except Exception:
+                pass
+
+        def _interim_text_cb(text: str, *, already_streamed: bool = False) -> None:
+            if already_streamed:
+                return
+            visible = str(text or "").strip()
+            if not visible:
+                return
+            if run_streamed_text["has_visible_text"]:
+                visible = "\n\n" + visible
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": visible,
+                })
+                run_streamed_text["has_visible_text"] = True
             except Exception:
                 pass
 
@@ -2973,6 +3015,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
+                    interim_assistant_callback=_interim_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
                     tool_start_callback=tool_start_cb,
