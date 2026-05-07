@@ -49,6 +49,13 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_cli.tui_observation import (
+    capture_tui_observation_snapshot,
+    get_tui_observation_status,
+    list_tui_observation_sessions,
+    redact_observation_text,
+    validate_pane_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -841,6 +848,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events_sse": True,
                 "run_stop": True,
                 "tool_progress_events": True,
+                "tui_observation": True,
+                "tui_observation_read_only": True,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "cors": bool(self._cors_origins),
             },
@@ -854,8 +863,97 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "tui_observation_status": {"method": "GET", "path": "/v1/tui-observation/status"},
+                "tui_observation_sessions": {"method": "GET", "path": "/v1/tui-observation/sessions"},
+                "tui_observation_snapshot": {"method": "GET", "path": "/v1/tui-observation/snapshot?pane_id={pane_id}"},
             },
         })
+
+    async def _handle_tui_observation_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/tui-observation/status — advertise read-only tmux observation state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            data = await get_tui_observation_status()
+        except Exception as exc:
+            return web.json_response({
+                "object": "hermes.tui_observation.status",
+                "schema": "tui.observation.v1",
+                "available": False,
+                "read_only": True,
+                "untrusted": True,
+                "transport": "tmux.capture-pane",
+                "redaction": {"enabled": True},
+                "error": redact_observation_text(str(exc)),
+            }, status=500)
+        data.setdefault("untrusted", True)
+        data.setdefault("transport", "tmux.capture-pane")
+        return web.json_response(data)
+
+    async def _handle_tui_observation_sessions(self, request: "web.Request") -> "web.Response":
+        """GET /v1/tui-observation/sessions — list mirrorable tmux panes."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            data = await list_tui_observation_sessions()
+        except Exception as exc:
+            return web.json_response({
+                "object": "hermes.tui_observation.session.list",
+                "schema": "tui.observation.v1",
+                "read_only": True,
+                "sessions": [],
+                "untrusted": True,
+                "redaction": {"enabled": True},
+                "error": redact_observation_text(str(exc)),
+            }, status=500)
+        return web.json_response(data)
+
+    async def _handle_tui_observation_snapshot(self, request: "web.Request") -> "web.Response":
+        """GET /v1/tui-observation/snapshot?pane_id=%12 — capture a redacted pane snapshot."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        raw_pane_id = request.query.get("pane_id", "")
+        if len(raw_pane_id) == 1 and ord(raw_pane_id) < 32:
+            raw_pane_id = f"%{ord(raw_pane_id):02x}"
+        try:
+            pane_id = validate_pane_id(raw_pane_id)
+        except ValueError:
+            return web.json_response({
+                "error": {"message": "Invalid tmux pane id", "type": "invalid_request_error"},
+            }, status=400)
+        try:
+            lines = int(request.query.get("lines", "80"))
+        except ValueError:
+            return web.json_response({
+                "error": {"message": "Invalid lines parameter", "type": "invalid_request_error"},
+            }, status=400)
+        try:
+            data = await capture_tui_observation_snapshot(pane_id, lines=lines)
+        except Exception as exc:
+            captured_at = time.time()
+            safe_error = redact_observation_text(str(exc))
+            return web.json_response({
+                "object": "hermes.tui_observation.snapshot",
+                "schema": "tui.observation.v1",
+                "id": pane_id,
+                "pane_id": pane_id,
+                "status": "error",
+                "reason": "capture_failed",
+                "confidence": 1.0,
+                "evidence": [safe_error],
+                "terminal": "",
+                "lines": [],
+                "line_count": 0,
+                "captured_at": captured_at,
+                "error": safe_error,
+                "read_only": True,
+                "untrusted": True,
+                "redaction": {"enabled": True},
+            }, status=500)
+        return web.json_response(data)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -2782,6 +2880,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/tui-observation/status", self._handle_tui_observation_status)
+            self._app.router.add_get("/v1/tui-observation/sessions", self._handle_tui_observation_sessions)
+            self._app.router.add_get("/v1/tui-observation/snapshot", self._handle_tui_observation_snapshot)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

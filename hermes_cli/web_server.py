@@ -48,6 +48,12 @@ from hermes_cli.config import (
     redact_key,
 )
 from gateway.status import get_running_pid, read_runtime_status
+from hermes_cli.tui_observation import (
+    capture_tui_observation_snapshot,
+    list_tui_observation_sessions,
+    redact_observation_text,
+    validate_pane_id,
+)
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -743,6 +749,60 @@ async def get_action_status(name: str, lines: int = 200):
         "pid": pid,
         "lines": tail,
     }
+
+
+@app.get("/api/tui/sessions")
+async def get_tui_sessions():
+    """List tmux panes that can be mirrored read-only by the dashboard."""
+    try:
+        return await list_tui_observation_sessions()
+    except Exception as exc:
+        return {
+            "object": "hermes.tui_observation.session.list",
+            "schema": "tui.observation.v1",
+            "sessions": [],
+            "read_only": True,
+            "untrusted": True,
+            "redaction": {"enabled": True},
+            "error": redact_observation_text(str(exc)),
+        }
+
+
+@app.get("/api/tui/sessions/{session_id}/snapshot")
+async def get_tui_session_snapshot(session_id: str, lines: int = 80):
+    """Capture a read-only, redacted snapshot from a tmux pane."""
+    # Starlette TestClient/HTTPX can double-decode ``%2512`` to the single
+    # control character ``\x12``.  Browsers normally deliver ``%12`` here when
+    # encodeURIComponent("%12") is used, but normalize both forms so pane ids
+    # remain URL-safe for dashboard clients and tests.
+    if len(session_id) == 1 and ord(session_id) < 32:
+        session_id = f"%{ord(session_id):02x}"
+    try:
+        pane_id = validate_pane_id(session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid tmux pane id") from exc
+    try:
+        return await capture_tui_observation_snapshot(pane_id, lines=lines)
+    except Exception as exc:
+        safe_error = redact_observation_text(str(exc))
+        return {
+            "object": "hermes.tui_observation.snapshot",
+            "schema": "tui.observation.v1",
+            "id": pane_id,
+            "pane_id": pane_id,
+            "status": "error",
+            "reason": "capture_failed",
+            "confidence": 1.0,
+            "evidence": [safe_error],
+            "terminal": "",
+            "lines": [],
+            "line_count": 0,
+            "captured_at": time.time(),
+            "error": safe_error,
+            "read_only": True,
+            "untrusted": True,
+            "redaction": {"enabled": True},
+        }
 
 
 @app.get("/api/sessions")
