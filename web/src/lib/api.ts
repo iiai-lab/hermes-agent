@@ -205,6 +205,14 @@ export const api = {
     }),
   getToolsets: () => fetchJSON<ToolsetInfo[]>("/api/tools/toolsets"),
 
+  // TUI Observation / Terminal Mirror (read-only tmux capture)
+  getTuiObservationSessions: () =>
+    fetchJSON<TuiObservationSessionList>("/api/tui/sessions"),
+  getTuiObservationSnapshot: (paneId: string, lines = 80) =>
+    fetchJSON<TuiObservationSnapshot>(
+      `/api/tui/sessions/${encodeURIComponent(paneId)}/snapshot?lines=${lines}`,
+    ),
+
   // Session search (FTS5)
   searchSessions: (q: string) =>
     fetchJSON<SessionSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(q)}`),
@@ -438,6 +446,66 @@ export interface SessionMessage {
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessage[];
+}
+
+export type TuiObservationStatus =
+  | "launching"
+  | "initializing"
+  | "input_not_ready"
+  | "idle_ready"
+  | "running"
+  | "streaming"
+  | "waiting_for_permission"
+  | "auth_required"
+  | "update_prompt"
+  | "blocked"
+  | "possibly_idle"
+  | "idle_ready_after_activity"
+  | "stale"
+  | "exited"
+  | "unknown"
+  | "error";
+
+export interface TuiObservationSession {
+  id: string;
+  pane_id: string;
+  session_name: string;
+  window_name: string;
+  pane_title: string;
+  command: string;
+  current_path: string;
+  active: boolean;
+  dead: boolean;
+  agent_kind: string;
+  attach_command: string;
+  capture_command: string;
+  read_only: boolean;
+}
+
+export interface TuiObservationSessionList {
+  object: "hermes.tui_observation.session.list";
+  schema: "tui.observation.v1";
+  read_only: boolean;
+  sessions: TuiObservationSession[];
+  error?: string;
+}
+
+export interface TuiObservationSnapshot {
+  object: "hermes.tui_observation.snapshot";
+  schema: "tui.observation.v1";
+  id: string;
+  pane_id: string;
+  status: TuiObservationStatus;
+  reason: string;
+  confidence: number;
+  evidence: string[];
+  terminal: string;
+  lines: string[];
+  line_count: number;
+  captured_at: number;
+  read_only: boolean;
+  untrusted: boolean;
+  redaction: { enabled: boolean };
 }
 
 export interface LogsResponse {

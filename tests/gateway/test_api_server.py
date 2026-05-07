@@ -357,6 +357,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_get("/v1/tui-observation/status", adapter._handle_tui_observation_status)
+    app.router.add_get("/v1/tui-observation/sessions", adapter._handle_tui_observation_sessions)
+    app.router.add_get("/v1/tui-observation/snapshot", adapter._handle_tui_observation_snapshot)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -594,8 +597,12 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["tui_observation"] is True
+            assert data["features"]["tui_observation_read_only"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["tui_observation_sessions"]["path"] == "/v1/tui-observation/sessions"
+            assert data["endpoints"]["tui_observation_snapshot"]["path"] == "/v1/tui-observation/snapshot?pane_id={pane_id}"
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -973,6 +980,138 @@ class TestRunsEndpoint:
         assert completed_tool_event["activity"]["data"]["toolCallId"] == "call-terminal-failed"
         assert completed_tool_event["activity"]["data"]["isError"] is True
         assert completed_tool_event["activity"]["data"]["duration"] == 0.25
+
+
+# ---------------------------------------------------------------------------
+# /v1/tui-observation endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestTuiObservationEndpoint:
+    @pytest.mark.asyncio
+    async def test_status_returns_read_only_contract(self, adapter):
+        from gateway.platforms import api_server as api_server_mod
+
+        async def fake_status():
+            return {
+                "object": "hermes.tui_observation.status",
+                "schema": "tui.observation.v1",
+                "available": True,
+                "read_only": True,
+                "redaction": {"enabled": True},
+                "limits": {"max_lines": 200, "max_bytes": 65536},
+            }
+
+        app = _create_app(adapter)
+        with patch.object(api_server_mod, "get_tui_observation_status", fake_status):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tui-observation/status")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "hermes.tui_observation.status"
+                assert data["schema"] == "tui.observation.v1"
+                assert data["available"] is True
+                assert data["read_only"] is True
+                assert data["untrusted"] is True
+                assert data["transport"] == "tmux.capture-pane"
+
+    @pytest.mark.asyncio
+    async def test_sessions_endpoint_returns_tmux_contract(self, adapter):
+        from gateway.platforms import api_server as api_server_mod
+
+        async def fake_list():
+            return {
+                "object": "hermes.tui_observation.session.list",
+                "schema": "tui.observation.v1",
+                "read_only": True,
+                "sessions": [{"id": "%12", "pane_id": "%12", "agent_kind": "claude-code"}],
+            }
+
+        app = _create_app(adapter)
+        with patch.object(api_server_mod, "list_tui_observation_sessions", fake_list):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tui-observation/sessions")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["read_only"] is True
+                assert data["sessions"][0]["pane_id"] == "%12"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_endpoint_returns_redacted_terminal_contract(self, adapter):
+        from gateway.platforms import api_server as api_server_mod
+
+        async def fake_capture(pane_id, lines=80):
+            assert pane_id == "%12"
+            assert lines == 32
+            return {
+                "object": "hermes.tui_observation.snapshot",
+                "schema": "tui.observation.v1",
+                "id": pane_id,
+                "pane_id": pane_id,
+                "status": "waiting_for_permission",
+                "reason": "permission_prompt",
+                "confidence": 0.86,
+                "evidence": ["visible: proceed?"],
+                "terminal": "Do you want to proceed? [REDACTED]",
+                "lines": ["Do you want to proceed? [REDACTED]"],
+                "line_count": 1,
+                "captured_at": 1778123456.0,
+                "read_only": True,
+                "untrusted": True,
+                "redaction": {"enabled": True},
+            }
+
+        app = _create_app(adapter)
+        with patch.object(api_server_mod, "capture_tui_observation_snapshot", fake_capture):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tui-observation/snapshot?pane_id=%2512&lines=32")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "hermes.tui_observation.snapshot"
+                assert data["pane_id"] == "%12"
+                assert data["read_only"] is True
+                assert data["untrusted"] is True
+                assert "[REDACTED]" in data["terminal"]
+
+    @pytest.mark.asyncio
+    async def test_snapshot_endpoint_redacts_unexpected_capture_exception(self, adapter):
+        from gateway.platforms import api_server as api_server_mod
+
+        async def fake_capture(_pane_id, lines=80):
+            raise RuntimeError("capture failed api_key=opaque-secret-value")
+
+        app = _create_app(adapter)
+        with patch.object(api_server_mod, "capture_tui_observation_snapshot", fake_capture):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/tui-observation/snapshot?pane_id=%2512")
+                assert resp.status == 500
+                data = await resp.json()
+                assert data["object"] == "hermes.tui_observation.snapshot"
+                assert data["schema"] == "tui.observation.v1"
+                assert data["id"] == "%12"
+                assert data["pane_id"] == "%12"
+                assert data["captured_at"] > 0
+                assert "opaque-secret-value" not in str(data)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_endpoint_rejects_invalid_pane_id(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/tui-observation/snapshot?pane_id=not-a-pane")
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_tui_observation_requires_auth_when_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/tui-observation/status")
+            assert resp.status == 401
+
+            authed = await cli.get(
+                "/v1/tui-observation/status",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert authed.status == 200
 
 
 # ---------------------------------------------------------------------------

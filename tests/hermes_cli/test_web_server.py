@@ -314,7 +314,7 @@ class TestWebServerEndpoints:
         except Exception:
             pass  # Not JSON — that's fine (SPA HTML)
 
-    def test_unauthenticated_api_blocked(self):
+    def test_api_requires_session_token(self):
         """API requests without the session token should be rejected."""
         from starlette.testclient import TestClient
         from hermes_cli.web_server import app
@@ -324,9 +324,137 @@ class TestWebServerEndpoints:
         assert resp.status_code == 401
         resp = unauth_client.get("/api/config")
         assert resp.status_code == 401
+        # TUI observation returns terminal contents and must not be public.
+        resp = unauth_client.get("/api/tui/sessions")
+        assert resp.status_code == 401
         # Public endpoints should still work
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
+
+    def test_tui_sessions_endpoint_returns_read_only_contract(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        async def fake_list():
+            return {
+                "object": "hermes.tui_observation.session.list",
+                "schema": "tui.observation.v1",
+                "sessions": [
+                    {
+                        "id": "%12",
+                        "pane_id": "%12",
+                        "label": "work:0.claude:%12",
+                        "session_name": "work",
+                        "window_name": "claude",
+                        "pane_title": "Claude Code",
+                        "current_path": "/repo",
+                        "dead": False,
+                        "command": "claude",
+                        "agent_kind": "claude-code",
+                        "status": "idle_ready",
+                        "reason": "known_agent_command",
+                        "confidence": 0.55,
+                        "evidence": ["command=claude"],
+                        "attach_command": "tmux attach-session -t work",
+                        "capture_command": "tmux capture-pane -p -t %12",
+                        "read_only": True,
+                        "untrusted": True,
+                    }
+                ],
+                "read_only": True,
+                "redaction": {"enabled": True},
+            }
+
+        monkeypatch.setattr(web_server, "list_tui_observation_sessions", fake_list)
+
+        resp = self.client.get("/api/tui/sessions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "hermes.tui_observation.session.list"
+        assert data["schema"] == "tui.observation.v1"
+        assert data["read_only"] is True
+        assert data["redaction"] == {"enabled": True}
+        assert data["sessions"][0]["id"] == "%12"
+        assert data["sessions"][0]["attach_command"] == "tmux attach-session -t work"
+
+    def test_tui_snapshot_endpoint_returns_redacted_terminal_contract(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        async def fake_capture(pane_id, lines=80):
+            assert pane_id == "%12"
+            assert lines == 40
+            return {
+                "object": "hermes.tui_observation.snapshot",
+                "schema": "tui.observation.v1",
+                "id": pane_id,
+                "pane_id": pane_id,
+                "status": "auth_required",
+                "reason": "login_required_screen",
+                "confidence": 0.91,
+                "evidence": ["visible: log in"],
+                "terminal": "Please log in\nOPENAI_API_KEY=[REDACTED]",
+                "lines": ["Please log in", "OPENAI_API_KEY=[REDACTED]"],
+                "line_count": 2,
+                "captured_at": 1778123456.0,
+                "read_only": True,
+                "untrusted": True,
+                "redaction": {"enabled": True},
+            }
+
+        monkeypatch.setattr(web_server, "capture_tui_observation_snapshot", fake_capture)
+
+        resp = self.client.get("/api/tui/sessions/%2512/snapshot?lines=40")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "hermes.tui_observation.snapshot"
+        assert data["pane_id"] == "%12"
+        assert data["read_only"] is True
+        assert data["untrusted"] is True
+        assert "[REDACTED]" in data["terminal"]
+
+    def test_tui_snapshot_endpoint_rejects_invalid_pane_id(self):
+        resp = self.client.get("/api/tui/sessions/not-a-pane/snapshot")
+
+        assert resp.status_code == 400
+
+    def test_tui_sessions_endpoint_returns_structured_error_on_helper_exception(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        async def fake_list():
+            raise RuntimeError("tmux missing token: opaque-token")
+
+        monkeypatch.setattr(web_server, "list_tui_observation_sessions", fake_list)
+
+        resp = self.client.get("/api/tui/sessions")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "hermes.tui_observation.session.list"
+        assert data["schema"] == "tui.observation.v1"
+        assert data["read_only"] is True
+        assert data["untrusted"] is True
+        assert "opaque-token" not in str(data)
+
+    def test_tui_snapshot_endpoint_returns_structured_error_on_helper_exception(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        async def fake_capture(_pane_id, lines=80):
+            raise RuntimeError("capture failed client_secret=opaque-client-secret")
+
+        monkeypatch.setattr(web_server, "capture_tui_observation_snapshot", fake_capture)
+
+        resp = self.client.get("/api/tui/sessions/%2512/snapshot")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "hermes.tui_observation.snapshot"
+        assert data["schema"] == "tui.observation.v1"
+        assert data["pane_id"] == "%12"
+        assert data["status"] == "error"
+        assert data["read_only"] is True
+        assert data["untrusted"] is True
+        assert "opaque-client-secret" not in str(data)
 
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
