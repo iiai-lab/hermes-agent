@@ -486,6 +486,9 @@ export interface TuiObservationSessionList {
   object: "hermes.tui_observation.session.list";
   schema: "tui.observation.v1";
   read_only: boolean;
+  untrusted?: boolean;
+  status?: "ok" | "error";
+  reason?: string;
   sessions: TuiObservationSession[];
   error?: string;
 }
