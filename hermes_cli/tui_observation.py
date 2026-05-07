@@ -41,7 +41,8 @@ _TUI_QUERY_SECRET_RE = re.compile(
 )
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password)\b\s*[:=]\s*[^\s]+"),
+    re.compile(r"(?i)\b[\w.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password)[\w.-]*\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)"),
+    re.compile(r"(?i)([\"']?[\w.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password)[\w.-]*[\"']?\s*:\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)"),
     re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s]+"),
     re.compile(r"sk-proj-[A-Za-z0-9_-]{16,}"),
     re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),

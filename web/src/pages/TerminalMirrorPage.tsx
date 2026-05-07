@@ -77,6 +77,9 @@ export default function TerminalMirrorPage() {
       .getTuiObservationSessions()
       .then((resp) => {
         if (sessionsRequestSeq.current !== requestSeq) return;
+        if (resp.status === "error") {
+          setError(resp.error || resp.reason || "tmux list-panes failed");
+        }
         setSessions(resp.sessions);
         setSelectedPaneId((currentPaneId) => {
           if (currentPaneId && resp.sessions.some((session) => session.pane_id === currentPaneId)) {

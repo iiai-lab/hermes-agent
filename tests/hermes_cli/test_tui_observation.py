@@ -90,7 +90,8 @@ def test_parse_tmux_list_panes_redacts_sensitive_metadata():
     assert "opaque-access-token" not in encoded
     assert "opaque-secret" not in encoded
     assert "opaque-token" not in encoded
-    assert "GITHUB_TOKEN" in encoded
+    assert "GITHUB_TOKEN" not in encoded
+    assert session["session_name"] == "[REDACTED]"
     assert session["pane_title"] == "[REDACTED]"
 
 
@@ -100,6 +101,8 @@ def test_redact_observation_text_masks_common_tokens():
     text = "\n".join(
         [
             f"OPENAI_API_KEY={raw_openai_key}",
+            "OPENAI_API_KEY=opaque-secret-value",
+            '{"api_key": "opaque-json-secret"}',
             f"standalone {raw_openai_key}",
             f"Authorization: Bearer {raw_bearer}",
             "https://example.test/callback?access_token=opaque-url-token&client_secret=opaque-secret",
@@ -114,6 +117,10 @@ def test_redact_observation_text_masks_common_tokens():
 
     assert raw_openai_key not in redacted
     assert "sk-proj-" not in redacted
+    assert "opaque-secret-value" not in redacted
+    assert "opaque...alue" not in redacted
+    assert "opaque-json-secret" not in redacted
+    assert "opaque...cret" not in redacted
     assert raw_bearer not in redacted
     assert "bearer-token-" not in redacted
     assert "opaque-url-token" not in redacted
