@@ -42,6 +42,7 @@ _TUI_QUERY_SECRET_RE = re.compile(
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|token|secret|password)\b\s*[:=]\s*[^\s]+"),
+    re.compile(r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s]+"),
     re.compile(r"sk-proj-[A-Za-z0-9_-]{16,}"),
     re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
@@ -157,9 +158,9 @@ def parse_tmux_panes(output: str) -> List[Dict[str, Any]]:
                 "dead": False,
                 "agent_kind": agent_kind,
                 "label": f"{safe_session_name}:{window_index}.{safe_window_name}:{safe_pane_id}",
-                "status": "idle_ready" if known_agent else "unknown",
-                "reason": "known_agent_command" if known_agent else "tmux_pane_listed",
-                "confidence": 0.55 if known_agent else 0.25,
+                "status": "possibly_idle" if known_agent else "unknown",
+                "reason": "known_agent_detected" if known_agent else "tmux_pane_listed",
+                "confidence": 0.35 if known_agent else 0.25,
                 "evidence": evidence,
                 "attach_command": f"tmux attach-session -t {shlex.quote(safe_session_name)}",
                 "capture_command": f"tmux capture-pane -p -t {safe_pane_id}",
@@ -170,8 +171,11 @@ def parse_tmux_panes(output: str) -> List[Dict[str, Any]]:
 
 def redact_observation_text(text: str) -> str:
     """Redact terminal-observed text at the API safety boundary."""
-    redacted = redact_sensitive_text(text or "", force=True)
+    redacted = text or ""
     redacted = _TUI_QUERY_SECRET_RE.sub(lambda match: f"{match.group(1)}***", redacted)
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    redacted = redact_sensitive_text(redacted, force=True)
     for pattern in _SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
@@ -279,25 +283,35 @@ async def get_tui_observation_status() -> Dict[str, Any]:
 
 
 async def list_tui_observation_sessions() -> Dict[str, Any]:
-    code, stdout, _stderr = await _run_tmux(["list-panes", "-a", "-F", TMUX_LIST_FORMAT], timeout=2.0)
-    if code != 0:
-        sessions: List[Dict[str, Any]] = []
-    else:
-        now = time.time()
-        sessions = []
-        for session in parse_tmux_panes(stdout):
-            item = dict(session)
-            item["updated_at"] = now
-            item["read_only"] = True
-            item["untrusted"] = True
-            sessions.append(item)
-    return {
+    code, stdout, stderr = await _run_tmux(["list-panes", "-a", "-F", TMUX_LIST_FORMAT], timeout=2.0)
+    sessions: List[Dict[str, Any]] = []
+    payload: Dict[str, Any] = {
         "object": "hermes.tui_observation.session.list",
         "schema": "tui.observation.v1",
         "sessions": sessions,
         "read_only": True,
+        "untrusted": True,
         "redaction": {"enabled": True},
     }
+    if code != 0:
+        payload.update(
+            {
+                "status": "error",
+                "reason": "tmux_list_panes_failed",
+                "error": redact_observation_text((stderr or "tmux list-panes failed").strip()[:200]),
+            }
+        )
+        return payload
+
+    now = time.time()
+    for session in parse_tmux_panes(stdout):
+        item = dict(session)
+        item["updated_at"] = now
+        item["read_only"] = True
+        item["untrusted"] = True
+        sessions.append(item)
+    payload["status"] = "ok"
+    return payload
 
 
 async def capture_tui_observation_snapshot(pane_id: str, *, lines: int = 80) -> Dict[str, Any]:

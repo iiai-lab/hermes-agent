@@ -55,9 +55,9 @@ def test_parse_tmux_list_panes_contract():
             "dead": False,
             "agent_kind": "claude-code",
             "label": "work:0.claude:%12",
-            "status": "idle_ready",
-            "reason": "known_agent_command",
-            "confidence": 0.55,
+            "status": "possibly_idle",
+            "reason": "known_agent_detected",
+            "confidence": 0.35,
             "evidence": ["command=claude", "title=Claude Code"],
             "attach_command": "tmux attach-session -t work",
             "capture_command": "tmux capture-pane -p -t %12",
@@ -91,15 +91,17 @@ def test_parse_tmux_list_panes_redacts_sensitive_metadata():
     assert "opaque-secret" not in encoded
     assert "opaque-token" not in encoded
     assert "GITHUB_TOKEN" in encoded
-    assert session["pane_title"].startswith("Authorization: Bearer")
+    assert session["pane_title"] == "[REDACTED]"
 
 
 def test_redact_observation_text_masks_common_tokens():
+    raw_openai_key = "sk-proj-" + "A" * 40
+    raw_bearer = "bearer-token-" + "B" * 32
     text = "\n".join(
         [
-            "OPENAI_API_KEY=sk-proj-smoke-test-redact-value",
-            "GITHUB_TOKEN=opaque-token-value",
-            "Authorization: Bearer opaque-access-token",
+            f"OPENAI_API_KEY={raw_openai_key}",
+            f"standalone {raw_openai_key}",
+            f"Authorization: Bearer {raw_bearer}",
             "https://example.test/callback?access_token=opaque-url-token&client_secret=opaque-secret",
             "api_key=opaque-lower-api-key",
             "token: opaque-colon-token",
@@ -110,15 +112,36 @@ def test_redact_observation_text_masks_common_tokens():
 
     redacted = tui_observation.redact_observation_text(text)
 
-    assert "sk-proj-smoke-test-redact-value" not in redacted
-    assert "opaque-token-value" not in redacted
-    assert "opaque-access-token" not in redacted
+    assert raw_openai_key not in redacted
+    assert "sk-proj-" not in redacted
+    assert raw_bearer not in redacted
+    assert "bearer-token-" not in redacted
     assert "opaque-url-token" not in redacted
     assert "opaque-secret" not in redacted
     assert "opaque-lower-api-key" not in redacted
     assert "opaque-colon-token" not in redacted
     assert "opaque-password-value" not in redacted
     assert "opaque-client-secret" not in redacted
+
+
+@pytest.mark.asyncio
+async def test_list_tui_observation_sessions_surfaces_tmux_error(monkeypatch):
+    async def fake_run_tmux(args, timeout=2.0):
+        assert args[:3] == ["list-panes", "-a", "-F"]
+        return 1, "", "tmux failed client_secret=opaque-list-secret"
+
+    monkeypatch.setattr(tui_observation, "_run_tmux", fake_run_tmux)
+
+    payload = await tui_observation.list_tui_observation_sessions()
+
+    assert payload["object"] == "hermes.tui_observation.session.list"
+    assert payload["schema"] == "tui.observation.v1"
+    assert payload["sessions"] == []
+    assert payload["status"] == "error"
+    assert payload["reason"] == "tmux_list_panes_failed"
+    assert payload["read_only"] is True
+    assert payload["untrusted"] is True
+    assert "opaque-list-secret" not in str(payload)
 
 
 @pytest.mark.parametrize(
