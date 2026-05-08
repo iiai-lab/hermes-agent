@@ -11726,7 +11726,12 @@ class GatewayRunner:
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
-        for platform, adapter in self.adapters.items():
+        # Snapshot the adapter map: an awaited send() can hit the adapter
+        # fatal path and remove entries from self.adapters mid-iteration,
+        # which would raise RuntimeError("dictionary changed size during
+        # iteration") on the next loop step. Mirrors the guard pattern
+        # used in _notify_active_sessions_of_shutdown.
+        for platform, adapter in list(self.adapters.items()):
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
