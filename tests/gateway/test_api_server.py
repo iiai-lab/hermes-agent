@@ -240,6 +240,48 @@ class TestAdapterInit:
             "http://127.0.0.1:3000",
         )
 
+    def test_invalid_port_from_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("API_SERVER_PORT", "not-a-port")
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        assert adapter._port == 8642
+
+    def test_create_agent_forwards_config_reasoning_effort(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://example.test/v1",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"agent": {"reasoning_effort": "xhigh"}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {"enabled": True, "effort": "xhigh"}),
+        )
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(session_id="api-session")
+
+        assert isinstance(agent, FakeAgent)
+        assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -356,7 +398,12 @@ class TestAgentExecution:
                 session_id="session-123",
             )
 
-        assert result == {"final_response": "ok"}
+        # _run_agent annotates result with the effective agent.session_id
+        # when it's a real string, so the response-header writer can track
+        # compression-triggered session rotations (#16938). The mock agent
+        # here doesn't set an explicit session_id string so the guard skips
+        # the annotation — header will fall back to the provided session_id.
+        assert result["final_response"] == "ok"
         assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
@@ -543,6 +590,10 @@ class TestCapabilitiesEndpoint:
             assert data["model"] == "hermes-agent"
             assert data["auth"]["type"] == "bearer"
             assert data["auth"]["required"] is False
+            assert data["runtime"]["mode"] == "server_agent"
+            assert data["runtime"]["tool_execution"] == "server"
+            assert data["runtime"]["split_runtime"] is False
+            assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
@@ -567,6 +618,368 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+# ---------------------------------------------------------------------------
+# /v1/runs endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRunsEndpoint:
+    @pytest.mark.asyncio
+    async def test_run_events_include_agent_activity_contract(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(
+                self,
+                tool_start_callback,
+                tool_complete_callback,
+                tool_progress_callback=None,
+            ):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.started",
+                        tool_name="terminal",
+                        preview="terminal ls",
+                        args={"cmd": "ls"},
+                    )
+                self.tool_start_callback(
+                    "call-terminal-1",
+                    "terminal",
+                    {"cmd": "ls"},
+                )
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.completed",
+                        tool_name="terminal",
+                    )
+                self.tool_complete_callback(
+                    "call-terminal-1",
+                    "terminal",
+                    {"cmd": "ls"},
+                    "done",
+                )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        tool_started_events = [event for event in events if event["event"] == "tool.started"]
+        tool_completed_events = [event for event in events if event["event"] == "tool.completed"]
+        assert len(tool_started_events) == 1
+        assert len(tool_completed_events) == 1
+
+        tool_event = next(event for event in events if event["event"] == "tool.started")
+        assert tool_event["activity"]["schema"] == "agent.activity.v1"
+        assert tool_event["activity"]["stream"] == "tool"
+        assert tool_event["activity"]["phase"] == "start"
+        assert tool_event["activity"]["runId"] == run_id
+        assert tool_event["activity"]["data"]["name"] == "terminal"
+        assert tool_event["activity"]["data"]["toolCallId"] == "call-terminal-1"
+
+        completed_tool_event = next(event for event in events if event["event"] == "tool.completed")
+        assert completed_tool_event["activity"]["schema"] == "agent.activity.v1"
+        assert completed_tool_event["activity"]["stream"] == "tool"
+        assert completed_tool_event["activity"]["phase"] == "completed"
+        assert completed_tool_event["activity"]["data"]["toolCallId"] == "call-terminal-1"
+
+        completed_event = next(event for event in events if event["event"] == "run.completed")
+        assert completed_event["activity"]["schema"] == "agent.activity.v1"
+        assert completed_event["activity"]["stream"] == "lifecycle"
+        assert completed_event["activity"]["phase"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_thinking_activity_for_reasoning(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_progress_callback=None):
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "reasoning.available",
+                        preview="Inspecting the request",
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        reasoning_event = next(event for event in events if event["event"] == "reasoning.available")
+        assert reasoning_event["activity"]["schema"] == "agent.activity.v1"
+        assert reasoning_event["activity"]["stream"] == "thinking"
+        assert reasoning_event["activity"]["phase"] == "update"
+        assert reasoning_event["activity"]["runId"] == run_id
+        assert reasoning_event["activity"]["data"]["statusLine"] == "Inspecting the request"
+
+    @pytest.mark.asyncio
+    async def test_tool_complete_without_id_drains_stale_metadata(self, adapter):
+        # Regression for codex review P2 on PR #4: when a provider-side
+        # tool.completed callback fires without a tool_call_id, the matching
+        # _tool_complete_callback used to early-return, leaving the metadata
+        # entry queued by _progress_callback in pending_tool_completions[name].
+        # The next well-formed completion for the same tool name then
+        # consumed the stale duration / is_error and corrupted the activity
+        # timeline. The fix drains the queue even when no ID is present.
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_start_callback, tool_complete_callback, tool_progress_callback=None):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                # First, a provider emits tool.completed without a usable
+                # tool_call_id. _progress_callback queues stale metadata.
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=99.9,
+                    is_error=True,
+                )
+                self.tool_complete_callback(None, "terminal", {"cmd": "ls"}, "stale")
+
+                # Then a well-formed call: progress queues fresh metadata,
+                # tool_complete_callback emits one event using the FRESH data.
+                self.tool_start_callback("call-terminal-1", "terminal", {"cmd": "ls"})
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=0.25,
+                    is_error=False,
+                )
+                self.tool_complete_callback("call-terminal-1", "terminal", {"cmd": "ls"}, "ok")
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed_events = [event for event in events if event["event"] == "tool.completed"]
+        # Only the well-formed call should emit a completion event.
+        assert len(completed_events) == 1
+        assert completed_events[0]["tool"] == "terminal"
+        # Critically, the duration / error must come from the FRESH metadata
+        # (0.25 / False), not the stale entry (99.9 / True). If the stale
+        # entry had leaked through, this assertion would fail.
+        assert completed_events[0]["duration"] == 0.25
+        assert completed_events[0]["error"] is False
+        assert completed_events[0]["activity"]["data"]["toolCallId"] == "call-terminal-1"
+        assert completed_events[0]["activity"]["phase"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_interim_assistant_message_deltas(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, interim_assistant_callback=None):
+                self.interim_assistant_callback = interim_assistant_callback
+
+            def run_conversation(self, **kwargs):
+                if self.interim_assistant_callback:
+                    self.interim_assistant_callback(
+                        "まずリポジトリを確認します。",
+                        already_streamed=False,
+                    )
+                    self.interim_assistant_callback(
+                        "次に差分を確認します。",
+                        already_streamed=False,
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("interim_assistant_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        deltas = [event["delta"] for event in events if event["event"] == "message.delta"]
+        assert deltas == [
+            "まずリポジトリを確認します。",
+            "\n\n次に差分を確認します。",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_events_merge_failed_tool_progress_metadata(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(
+                self,
+                tool_start_callback,
+                tool_complete_callback,
+                tool_progress_callback=None,
+            ):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                self.tool_start_callback(
+                    "call-terminal-failed",
+                    "terminal",
+                    {"cmd": "bad"},
+                )
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.completed",
+                        tool_name="terminal",
+                        duration=0.25,
+                        is_error=True,
+                    )
+                self.tool_complete_callback(
+                    "call-terminal-failed",
+                    "terminal",
+                    {"cmd": "bad"},
+                    "boom",
+                )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed_tool_events = [event for event in events if event["event"] == "tool.completed"]
+        assert len(completed_tool_events) == 1
+
+        completed_tool_event = completed_tool_events[0]
+        assert completed_tool_event["run_id"] == run_id
+        assert completed_tool_event["error"] is True
+        assert completed_tool_event["duration"] == 0.25
+        assert completed_tool_event["activity"]["phase"] == "failed"
+        assert completed_tool_event["activity"]["data"]["toolCallId"] == "call-terminal-failed"
+        assert completed_tool_event["activity"]["data"]["isError"] is True
+        assert completed_tool_event["activity"]["data"]["duration"] == 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +1181,49 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_surfaces_interim_assistant_commentary(self, adapter):
+        """Completed mid-turn assistant commentary is streamed before final completion."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("interim_assistant_callback")
+                if cb:
+                    cb("まずリポジトリを確認します。", already_streamed=False)
+                    cb("次に差分を確認します。", already_streamed=False)
+                return (
+                    {"final_response": "done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                import json as _json
+
+                content_chunks = []
+                for line in body.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = _json.loads(line[len("data: "):])
+                    content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                    if content:
+                        content_chunks.append(content)
+                assert content_chunks == [
+                    "まずリポジトリを確認します。",
+                    "\n\n次に差分を確認します。",
+                ]
+                assert body.index('"content"') < body.index('"finish_reason": "stop"')
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
@@ -1453,6 +1909,146 @@ class TestResponsesEndpoint:
             assert call_kwargs["user_message"] == "Now add 1 more"
 
     @pytest.mark.asyncio
+    async def test_previous_response_id_stores_full_agent_transcript_once(self, adapter):
+        """Chained Responses storage must not append result["messages"] twice."""
+        first_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "2",
+                        "messages": list(first_history),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp1 = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "What is 1+1?"},
+                )
+
+            assert resp1.status == 200
+            resp1_data = await resp1.json()
+            stored_first = adapter._response_store.get(resp1_data["id"])
+            assert stored_first["conversation_history"] == first_history
+
+            second_history = first_history + [
+                {"role": "user", "content": "Now add 1 more"},
+                {"role": "assistant", "content": "3"},
+            ]
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "3",
+                        "messages": list(second_history),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp2 = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": resp1_data["id"],
+                    },
+                )
+
+            assert resp2.status == 200
+            resp2_data = await resp2.json()
+            stored_second = adapter._response_store.get(resp2_data["id"])
+            stored_history = stored_second["conversation_history"]
+            assert stored_history == second_history
+            assert stored_history.count(first_history[0]) == 1
+            assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1
+
+    @pytest.mark.asyncio
+    async def test_previous_response_id_outputs_only_current_turn_items(self, adapter):
+        """Response output must not replay previous tool artifacts."""
+        prior_history = [
+            {"role": "user", "content": "Read old file"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"old.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": '{"content":"old"}',
+            },
+            {"role": "assistant", "content": "old"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+        full_agent_transcript = prior_history + [
+            {"role": "user", "content": "Read new file"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_new",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"new.txt"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_new",
+                "content": '{"content":"new"}',
+            },
+            {"role": "assistant", "content": "new"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "new",
+                        "messages": list(full_agent_transcript),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Read new file",
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        output_json = json.dumps(data["output"])
+        assert "call_new" in output_json
+        assert "call_old" not in output_json
+        assert "old.txt" not in output_json
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_preserves_session(self, adapter):
         """Chained responses via previous_response_id reuse the same session_id."""
         mock_result = {
@@ -1718,6 +2314,71 @@ class TestResponsesStreaming:
                 assert data["id"] == response_id
                 assert data["status"] == "completed"
                 assert data["output"][-1]["content"][0]["text"] == "Stored response"
+
+    @pytest.mark.asyncio
+    async def test_streamed_previous_response_id_stores_full_agent_transcript_once(self, adapter):
+        prior_history = [
+            {"role": "user", "content": "What is 1+1?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+
+        expected_history = prior_history + [
+            {"role": "user", "content": "Now add 1 more"},
+            {"role": "assistant", "content": "3"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("3")
+                return (
+                    {
+                        "final_response": "3",
+                        "messages": list(expected_history),
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Now add 1 more",
+                        "previous_response_id": "resp_prev",
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        response_id = None
+        for line in body.splitlines():
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[len("data: "):])
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "response.completed":
+                    response_id = payload["response"]["id"]
+                    break
+
+        assert response_id
+        stored_history = adapter._response_store.get(response_id)["conversation_history"]
+        assert stored_history == expected_history
+        assert stored_history.count(prior_history[0]) == 1
+        assert stored_history.count({"role": "user", "content": "Now add 1 more"}) == 1
 
     @pytest.mark.asyncio
     async def test_stream_cancelled_persists_incomplete_snapshot(self, adapter):
@@ -2660,3 +3321,277 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# X-Hermes-Session-Key header (long-term memory scoping)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionKeyHeader:
+    """The session key is a stable per-channel identifier that scopes
+    long-term memory (e.g. Honcho) independently of the transcript-scoped
+    session_id.  A third-party Web UI passes one stable key per assistant
+    channel and rotates session_id on /new, matching the native
+    gateway's session_key / session_id split.
+    """
+
+    @pytest.mark.asyncio
+    async def test_session_key_passed_to_agent_and_echoed(self, auth_adapter):
+        """X-Hermes-Session-Key reaches _run_agent as gateway_session_key and is echoed back."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Key": "webui:user-42",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status == 200
+            assert resp.headers.get("X-Hermes-Session-Key") == "webui:user-42"
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["gateway_session_key"] == "webui:user-42"
+
+    @pytest.mark.asyncio
+    async def test_session_key_independent_of_session_id(self, auth_adapter):
+        """Both headers coexist: key scopes memory, id scopes transcript."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        mock_db = MagicMock()
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Key": "channel-abc",
+                        "X-Hermes-Session-Id": "transcript-xyz",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status == 200
+            assert resp.headers.get("X-Hermes-Session-Key") == "channel-abc"
+            assert resp.headers.get("X-Hermes-Session-Id") == "transcript-xyz"
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["gateway_session_key"] == "channel-abc"
+            assert call_kwargs["session_id"] == "transcript-xyz"
+
+    @pytest.mark.asyncio
+    async def test_session_key_absent_yields_none(self, auth_adapter):
+        """Omitting the header passes gateway_session_key=None and doesn't echo."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status == 200
+            assert "X-Hermes-Session-Key" not in resp.headers
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["gateway_session_key"] is None
+
+    @pytest.mark.asyncio
+    async def test_session_key_rejected_without_api_key(self, adapter):
+        """Without API_SERVER_KEY, accepting a caller-supplied memory scope is unsafe — reject with 403."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Session-Key": "whatever"},
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_session_key_rejects_control_chars(self, auth_adapter):
+        """Header injection via \\r\\n must be rejected by the server-side validator.
+
+        Note: aiohttp client refuses to SEND a header containing CR/LF
+        (that check fires before the request leaves the client), so we
+        can't reach this code path through TestClient.  Test the helper
+        directly instead with a raw request that bypasses client-side
+        validation.
+        """
+        mock_request = MagicMock()
+        mock_request.headers = {"X-Hermes-Session-Key": "bad\rvalue"}
+        key, err = auth_adapter._parse_session_key_header(mock_request)
+        assert key is None
+        assert err is not None
+        assert err.status == 400
+
+    @pytest.mark.asyncio
+    async def test_session_key_rejects_oversized(self, auth_adapter):
+        """Session keys longer than the cap are rejected."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Session-Key": "x" * 1000, "Authorization": "Bearer sk-secret"},
+                json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_session_key_threads_into_create_agent(self, auth_adapter):
+        """End-to-end: verify AIAgent(gateway_session_key=...) receives the key via _create_agent."""
+        captured_kwargs = {}
+
+        def _fake_create_agent(**kwargs):
+            captured_kwargs.update(kwargs)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok", "messages": []}
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent", side_effect=_fake_create_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Key": "agent:main:webui:dm:user-7",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                )
+            assert resp.status == 200
+            # _create_agent must be called with gateway_session_key threaded through
+            assert captured_kwargs.get("gateway_session_key") == "agent:main:webui:dm:user-7"
+
+    @pytest.mark.asyncio
+    async def test_responses_endpoint_accepts_session_key(self, auth_adapter):
+        """Responses API honors the same X-Hermes-Session-Key contract."""
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={
+                        "X-Hermes-Session-Key": "webui:chan-1",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"model": "hermes-agent", "input": "hello", "store": False},
+                )
+            assert resp.status == 200
+            assert resp.headers.get("X-Hermes-Session-Key") == "webui:chan-1"
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["gateway_session_key"] == "webui:chan-1"
+
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_session_key_header(self, adapter):
+        """GET /v1/capabilities should advertise the new header so clients can feature-detect."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+
+
+# ---------------------------------------------------------------------------
+# _build_response_conversation_history (preserve current user turn)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildResponseConversationHistory:
+    """Regression tests for codex review P2 on PR #5: when result["messages"]
+    matches only the prior history (without the current user turn),
+    _build_response_conversation_history must NOT drop the just-submitted
+    user message — that would cause subsequent continuation requests to
+    resume from stale context.
+    """
+
+    def test_full_prefix_preserves_returned_transcript(self):
+        # turn_start == len(prior + [current_user]): agent returned a full
+        # transcript that already includes prior + current_user + new turn.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "earlier"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_prior_only_prefix_keeps_current_user_turn(self):
+        # turn_start == len(prior): result["messages"] echoes prior history
+        # but OMITS the current user turn (e.g. some providers stream only
+        # post-user content). Without the fix, the current_user message is
+        # dropped from stored history and continuation requests lose
+        # context. With the fix, current_user is spliced in.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "earlier"},
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_no_prefix_match_appends_current_user_then_messages(self):
+        # turn_start == 0: agent returned only its own emission (no prior
+        # echo). prior + current_user + agent_messages is the correct
+        # composed transcript.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_empty_messages_falls_back_to_final_response(self):
+        # No messages list → fall back to the legacy synthetic transcript.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {"messages": []}
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "fallback-ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "fallback-ack"},
+        ]
+
