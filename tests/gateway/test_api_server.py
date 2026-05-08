@@ -3503,3 +3503,95 @@ class TestSessionKeyHeader:
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
 
+
+# ---------------------------------------------------------------------------
+# _build_response_conversation_history (preserve current user turn)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildResponseConversationHistory:
+    """Regression tests for codex review P2 on PR #5: when result["messages"]
+    matches only the prior history (without the current user turn),
+    _build_response_conversation_history must NOT drop the just-submitted
+    user message — that would cause subsequent continuation requests to
+    resume from stale context.
+    """
+
+    def test_full_prefix_preserves_returned_transcript(self):
+        # turn_start == len(prior + [current_user]): agent returned a full
+        # transcript that already includes prior + current_user + new turn.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "earlier"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_prior_only_prefix_keeps_current_user_turn(self):
+        # turn_start == len(prior): result["messages"] echoes prior history
+        # but OMITS the current user turn (e.g. some providers stream only
+        # post-user content). Without the fix, the current_user message is
+        # dropped from stored history and continuation requests lose
+        # context. With the fix, current_user is spliced in.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "earlier"},
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_no_prefix_match_appends_current_user_then_messages(self):
+        # turn_start == 0: agent returned only its own emission (no prior
+        # echo). prior + current_user + agent_messages is the correct
+        # composed transcript.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {
+            "messages": [
+                {"role": "assistant", "content": "ack"},
+            ]
+        }
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+    def test_empty_messages_falls_back_to_final_response(self):
+        # No messages list → fall back to the legacy synthetic transcript.
+        prior = [{"role": "assistant", "content": "earlier"}]
+        user_message = "hi"
+        result = {"messages": []}
+        out = APIServerAdapter._build_response_conversation_history(
+            prior, user_message, result, "fallback-ack",
+        )
+        assert out == [
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "fallback-ack"},
+        ]
+

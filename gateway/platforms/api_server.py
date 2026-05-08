@@ -2642,12 +2642,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 user_message,
                 result,
             )
-            if turn_start:
-                return list(agent_messages)
-
+            # turn_start can be 0 (no prefix), len(prior) (prior matched but
+            # current_user NOT present in agent_messages), or
+            # len(prior + [current_user]) (full expected prefix matched).
+            # Always rebuild as prior + current_user + agent_messages[turn_start:]
+            # so the just-submitted user turn is never dropped from stored
+            # history when the model echoes only the prior history back.
             full_history = prior
             full_history.append(current_user)
-            full_history.extend(agent_messages)
+            full_history.extend(agent_messages[turn_start:])
             return full_history
 
         full_history = prior
