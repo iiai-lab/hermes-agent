@@ -764,6 +764,87 @@ class TestRunsEndpoint:
         assert reasoning_event["activity"]["data"]["statusLine"] == "Inspecting the request"
 
     @pytest.mark.asyncio
+    async def test_tool_complete_without_id_drains_stale_metadata(self, adapter):
+        # Regression for codex review P2 on PR #4: when a provider-side
+        # tool.completed callback fires without a tool_call_id, the matching
+        # _tool_complete_callback used to early-return, leaving the metadata
+        # entry queued by _progress_callback in pending_tool_completions[name].
+        # The next well-formed completion for the same tool name then
+        # consumed the stale duration / is_error and corrupted the activity
+        # timeline. The fix drains the queue even when no ID is present.
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_start_callback, tool_complete_callback, tool_progress_callback=None):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                # First, a provider emits tool.completed without a usable
+                # tool_call_id. _progress_callback queues stale metadata.
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=99.9,
+                    is_error=True,
+                )
+                self.tool_complete_callback(None, "terminal", {"cmd": "ls"}, "stale")
+
+                # Then a well-formed call: progress queues fresh metadata,
+                # tool_complete_callback emits one event using the FRESH data.
+                self.tool_start_callback("call-terminal-1", "terminal", {"cmd": "ls"})
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=0.25,
+                    is_error=False,
+                )
+                self.tool_complete_callback("call-terminal-1", "terminal", {"cmd": "ls"}, "ok")
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed_events = [event for event in events if event["event"] == "tool.completed"]
+        # Only the well-formed call should emit a completion event.
+        assert len(completed_events) == 1
+        assert completed_events[0]["tool"] == "terminal"
+        # Critically, the duration / error must come from the FRESH metadata
+        # (0.25 / False), not the stale entry (99.9 / True). If the stale
+        # entry had leaked through, this assertion would fail.
+        assert completed_events[0]["duration"] == 0.25
+        assert completed_events[0]["error"] is False
+        assert completed_events[0]["activity"]["data"]["toolCallId"] == "call-terminal-1"
+        assert completed_events[0]["activity"]["phase"] == "completed"
+
+    @pytest.mark.asyncio
     async def test_run_events_include_interim_assistant_message_deltas(self, adapter):
         class FakeAgent:
             session_prompt_tokens = 1

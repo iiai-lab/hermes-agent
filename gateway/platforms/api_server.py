@@ -2828,14 +2828,26 @@ class APIServerAdapter(BasePlatformAdapter):
             ))
 
         def _tool_complete_callback(tool_call_id, function_name, function_args, function_result):
+            key = function_name or "tool"
             if not tool_call_id:
+                # No ID means we cannot emit a structured run event, but
+                # ``_progress_callback`` already enqueued metadata keyed by
+                # tool name. Drain it so a later well-formed completion for
+                # the same tool name doesn't consume stale duration / error
+                # values — that would corrupt activity timelines for
+                # downstream clients.
+                stale_queue = pending_tool_completions.get(key) or []
+                if stale_queue:
+                    stale_queue.pop(0)
+                    if not stale_queue:
+                        pending_tool_completions.pop(key, None)
                 return
             ts = time.time()
             started_at = tool_started_at.pop(tool_call_id, None)
-            metadata_queue = pending_tool_completions.get(function_name or "tool") or []
+            metadata_queue = pending_tool_completions.get(key) or []
             metadata = metadata_queue.pop(0) if metadata_queue else {}
             if not metadata_queue:
-                pending_tool_completions.pop(function_name or "tool", None)
+                pending_tool_completions.pop(key, None)
             metadata_duration = metadata.get("duration")
             duration = metadata_duration
             if duration is None and started_at is not None:
