@@ -3,6 +3,8 @@ OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
+- GET  /v1/chat/completions/runs/{run_id}/stream — Reattach SSE consumer to a chat-completion run after a brief disconnect (grace window)
+- POST /v1/chat/completions/runs/{run_id}/abort  — Force-abort a running chat completion (works during stream and grace)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
@@ -69,6 +71,16 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+# Resumable chat-completion stream tuning.
+# When the SSE client disconnects mid-stream, the agent task is held alive for
+# CHAT_RUN_GRACE_SECONDS so a reattaching client (same X-Hermes-Run-Id) can
+# resume from the cached SSE event sequence.  After grace expires with no
+# resume, the agent is interrupted and the buffer is dropped.  Terminal
+# buffers are retained for CHAT_RUN_BUFFER_TTL_SECONDS to let slow clients
+# replay the final answer once.
+CHAT_RUN_GRACE_SECONDS = 30.0
+CHAT_RUN_BUFFER_TTL_SECONDS = 300.0
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -535,6 +547,128 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
+class _ChatRunBuffer:
+    """Resumable per-run buffer for streaming chat completions.
+
+    Decouples the agent's queue producer from the client SSE consumer so that
+    a brief client disconnect (e.g. browser reload while the agent is editing
+    the MCUI source and Vite triggers a full-reload) does not interrupt the
+    agent task.
+
+    The producer task drains ``stream_q`` (a thread-safe ``queue.Queue`` fed
+    by the agent's stream callbacks), formats each item as a complete SSE
+    event (with a monotonic ``id:`` field for client-side cursor tracking)
+    and appends it to ``chunks``.  One or more SSE writers may attach by
+    calling ``replay_and_follow`` with a ``since`` cursor; replay is
+    idempotent because the formatted bytes are stable.
+
+    Lifecycle:
+        running -> grace -> aborted          (subscriber dropped, no resume)
+        running -> done                      (agent completed, terminal retained)
+        running -> aborted                   (explicit abort)
+    """
+
+    __slots__ = (
+        "completion_id",
+        "model",
+        "created",
+        "stream_q",
+        "agent_ref",
+        "agent_task",
+        "session_id",
+        "gateway_session_key",
+        "chunks",
+        "status",
+        "subscriber_count",
+        "last_subscriber_disconnected_at",
+        "created_at",
+        "_waiters",
+        "_terminal",
+        "_producer_task",
+        "_grace_task",
+    )
+
+    def __init__(
+        self,
+        completion_id: str,
+        model: str,
+        created: int,
+        stream_q: Any,
+        agent_ref: List[Any],
+        agent_task: "asyncio.Task[Any]",
+        session_id: Optional[str],
+        gateway_session_key: Optional[str],
+    ) -> None:
+        self.completion_id = completion_id
+        self.model = model
+        self.created = created
+        self.stream_q = stream_q
+        self.agent_ref = agent_ref
+        self.agent_task = agent_task
+        self.session_id = session_id
+        self.gateway_session_key = gateway_session_key
+        # Each entry is the full SSE event bytes including ``id: <seq>\n``.
+        self.chunks: List[bytes] = []
+        self.status: str = "running"
+        self.subscriber_count: int = 0
+        self.last_subscriber_disconnected_at: Optional[float] = None
+        self.created_at: float = time.monotonic()
+        self._waiters: List["asyncio.Future[None]"] = []
+        self._terminal: bool = False
+        self._producer_task: Optional["asyncio.Task[Any]"] = None
+        self._grace_task: Optional["asyncio.Task[Any]"] = None
+
+    @property
+    def terminal(self) -> bool:
+        return self._terminal
+
+    @property
+    def seq(self) -> int:
+        """Number of buffered SSE events (next assigned id)."""
+        return len(self.chunks)
+
+    def _wake_waiters(self) -> None:
+        for fut in self._waiters:
+            if not fut.done():
+                fut.set_result(None)
+        self._waiters.clear()
+
+    def append_event(self, raw: bytes) -> None:
+        """Append a fully-formatted SSE event (without ``id:``) and wake waiters.
+
+        The buffer prepends ``id: <seq>\\n`` so resuming clients can ask for
+        ``?since=<lastSeq>`` and replay only the missing tail.
+        """
+        seq = len(self.chunks)
+        framed = f"id: {seq}\n".encode() + raw
+        self.chunks.append(framed)
+        self._wake_waiters()
+
+    def mark_terminal(self, status: str) -> None:
+        if self._terminal:
+            return
+        self.status = status
+        self._terminal = True
+        self._wake_waiters()
+
+    async def wait_more(self, timeout: float) -> None:
+        """Wait until a new chunk arrives, the buffer becomes terminal, or the timeout elapses."""
+        if self._terminal:
+            return
+        loop = asyncio.get_event_loop()
+        fut: "asyncio.Future[None]" = loop.create_future()
+        self._waiters.append(fut)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            try:
+                self._waiters.remove(fut)
+            except ValueError:
+                pass
+
+
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
@@ -624,6 +758,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Resumable chat-completion stream buffers: completion_id -> _ChatRunBuffer.
+        # Survives brief client disconnects so a reattaching SSE consumer can
+        # resume by run id; see _ChatRunBuffer / _stream_chat_buffer.
+        self._chat_run_buffers: Dict[str, _ChatRunBuffer] = {}
+        # Background tasks (producers, grace watchers) we want to keep alive
+        # without leaking strong references on the event loop.
+        self._background_tasks: set = set()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1285,11 +1426,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
             ))
 
-            return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
+            buffer = _ChatRunBuffer(
+                completion_id=completion_id,
+                model=model_name,
+                created=created,
+                stream_q=_stream_q,
+                agent_ref=agent_ref,
+                agent_task=agent_task,
+                session_id=session_id,
                 gateway_session_key=gateway_session_key,
             )
+            self._chat_run_buffers[completion_id] = buffer
+            producer = asyncio.create_task(self._chat_buffer_producer(buffer))
+            buffer._producer_task = producer
+            self._background_tasks.add(producer)
+            producer.add_done_callback(self._background_tasks.discard)
+
+            return await self._stream_chat_buffer(request, buffer, since=0)
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
@@ -1552,6 +1705,312 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         return response
+
+    # ------------------------------------------------------------------
+    # Resumable chat-completion stream support
+    # ------------------------------------------------------------------
+
+    async def _chat_buffer_producer(self, buffer: "_ChatRunBuffer") -> None:
+        """Drain the agent's thread-queue, format SSE events, append to buffer.
+
+        Survives any number of client disconnects: subscribers come and go,
+        but the producer keeps reading from ``buffer.stream_q`` until the
+        agent task ends or the grace watcher cancels it.
+        """
+        import queue as _q
+
+        loop = asyncio.get_running_loop()
+        completion_id = buffer.completion_id
+        model = buffer.model
+        created = buffer.created
+
+        # Role chunk (assistant header).  Must be the first event so resuming
+        # clients with ``since=0`` receive the full transcript prefix.
+        role_chunk = {
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        buffer.append_event(f"data: {json.dumps(role_chunk)}\n\n".encode())
+
+        try:
+            while True:
+                try:
+                    delta = await loop.run_in_executor(
+                        None, lambda: buffer.stream_q.get(timeout=0.5)
+                    )
+                except _q.Empty:
+                    if buffer.agent_task.done():
+                        # Drain any remaining items the agent enqueued
+                        # between the last poll and task completion.
+                        while True:
+                            try:
+                                delta = buffer.stream_q.get_nowait()
+                                if delta is None:
+                                    break
+                                self._append_chat_delta(buffer, delta)
+                            except _q.Empty:
+                                break
+                        break
+                    continue
+
+                if delta is None:
+                    break
+                self._append_chat_delta(buffer, delta)
+
+            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            try:
+                _result, agent_usage = await buffer.agent_task
+                usage = agent_usage or usage
+                final_status = "done"
+            except asyncio.CancelledError:
+                final_status = "aborted"
+            except Exception as exc:
+                logger.warning(
+                    "Agent task %s failed during chat-buffer producer: %s",
+                    completion_id, exc,
+                )
+                final_status = "error"
+
+            finish_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop" if final_status == "done" else (
+                        "error" if final_status == "error" else "stop"
+                    ),
+                }],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+            buffer.append_event(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            buffer.append_event(b"data: [DONE]\n\n")
+            buffer.mark_terminal(final_status)
+        finally:
+            # Schedule TTL-based cleanup of the terminal buffer so a
+            # client that reconnects shortly after completion can still
+            # replay the final answer once.
+            asyncio.create_task(self._chat_buffer_terminal_cleanup(buffer))
+
+    def _append_chat_delta(self, buffer: "_ChatRunBuffer", delta: Any) -> None:
+        """Format a single agent stream item as SSE bytes and append."""
+        if isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__tool_progress__":
+            event_data = json.dumps(delta[1])
+            buffer.append_event(
+                f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+            )
+            return
+        content_chunk = {
+            "id": buffer.completion_id, "object": "chat.completion.chunk",
+            "created": buffer.created, "model": buffer.model,
+            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+        }
+        buffer.append_event(f"data: {json.dumps(content_chunk)}\n\n".encode())
+
+    async def _chat_buffer_terminal_cleanup(self, buffer: "_ChatRunBuffer") -> None:
+        """Drop the buffer ``CHAT_RUN_BUFFER_TTL_SECONDS`` after it goes terminal."""
+        await asyncio.sleep(CHAT_RUN_BUFFER_TTL_SECONDS)
+        self._chat_run_buffers.pop(buffer.completion_id, None)
+
+    async def _chat_grace_watcher(self, buffer: "_ChatRunBuffer") -> None:
+        """Wait the grace period; if no subscriber re-attached, abort the run."""
+        await asyncio.sleep(CHAT_RUN_GRACE_SECONDS)
+        if buffer.subscriber_count > 0 or buffer.terminal:
+            return
+        # No resume — interrupt the agent and cancel the task.
+        if buffer.agent_ref and buffer.agent_ref[0] is not None:
+            try:
+                buffer.agent_ref[0].interrupt("SSE grace period expired")
+            except Exception:
+                pass
+        if buffer._producer_task and not buffer._producer_task.done():
+            try:
+                buffer.agent_task.cancel()
+            except Exception:
+                pass
+        buffer.mark_terminal("aborted")
+        logger.info(
+            "Chat run %s aborted after %.0fs grace with no resume",
+            buffer.completion_id, CHAT_RUN_GRACE_SECONDS,
+        )
+
+    async def _stream_chat_buffer(
+        self,
+        request: "web.Request",
+        buffer: "_ChatRunBuffer",
+        since: int,
+    ) -> "web.StreamResponse":
+        """Initial or resumed SSE writer.  Replays from ``since`` then follows live."""
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            # Emitted up front (before the first chunk) so the client can
+            # persist the run id even if it loses the connection before
+            # any chat.completion.chunk arrives.  See M2 in tasks/todo.md.
+            "X-Hermes-Run-Id": buffer.completion_id,
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        if buffer.session_id:
+            sse_headers["X-Hermes-Session-Id"] = buffer.session_id
+        if buffer.gateway_session_key:
+            sse_headers["X-Hermes-Session-Key"] = buffer.gateway_session_key
+
+        response = web.StreamResponse(status=200, headers=sse_headers)
+        await response.prepare(request)
+
+        # A subscriber attached — cancel any pending grace abort.
+        buffer.subscriber_count += 1
+        if buffer.status == "grace":
+            buffer.status = "running"
+        if buffer._grace_task and not buffer._grace_task.done():
+            buffer._grace_task.cancel()
+            buffer._grace_task = None
+
+        cursor = max(0, since)
+        if cursor > len(buffer.chunks):
+            # Client claims a future seq we never produced; reset to current.
+            cursor = len(buffer.chunks)
+        last_activity = time.monotonic()
+
+        try:
+            while True:
+                # Replay any chunks past the cursor.
+                while cursor < len(buffer.chunks):
+                    await response.write(buffer.chunks[cursor])
+                    cursor += 1
+                    last_activity = time.monotonic()
+
+                if buffer.terminal:
+                    break
+
+                # Wait for new chunks or for the producer to finish.
+                await buffer.wait_more(timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+                if cursor >= len(buffer.chunks) and not buffer.terminal:
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Subscriber dropped mid-stream.  Do NOT interrupt the agent —
+            # the producer keeps filling the buffer and a fresh subscriber
+            # may resume by run id within the grace window.
+            logger.info(
+                "Chat run %s SSE subscriber disconnected; entering grace window",
+                buffer.completion_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error(
+                "Chat run %s SSE writer crashed: %s", buffer.completion_id, exc,
+            )
+        finally:
+            buffer.subscriber_count -= 1
+            if buffer.subscriber_count <= 0 and not buffer.terminal:
+                buffer.status = "grace"
+                buffer.last_subscriber_disconnected_at = time.monotonic()
+                grace = asyncio.create_task(self._chat_grace_watcher(buffer))
+                buffer._grace_task = grace
+                self._background_tasks.add(grace)
+                grace.add_done_callback(self._background_tasks.discard)
+
+        return response
+
+    def _check_chat_buffer_session(
+        self, buffer: "_ChatRunBuffer", request: "web.Request",
+    ) -> Optional["web.Response"]:
+        """Authorise resume/abort by matching session headers against the buffer."""
+        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if buffer.session_id and provided_session_id and provided_session_id != buffer.session_id:
+            return web.json_response(
+                _openai_error("Session mismatch", err_type="permission_error"),
+                status=403,
+            )
+        provided_session_key = request.headers.get("X-Hermes-Session-Key", "").strip()
+        if (
+            buffer.gateway_session_key
+            and provided_session_key
+            and provided_session_key != buffer.gateway_session_key
+        ):
+            return web.json_response(
+                _openai_error("Session-key mismatch", err_type="permission_error"),
+                status=403,
+            )
+        return None
+
+    async def _handle_chat_completion_resume(
+        self, request: "web.Request",
+    ) -> "web.StreamResponse":
+        """Reattach an SSE subscriber to a live or terminal chat-completion run.
+
+        Query params:
+            since (int): last buffered seq the client has already received.
+                         Replay starts at this index.
+
+        Headers:
+            X-Hermes-Session-Id / X-Hermes-Session-Key — must match the
+            buffer's original session bindings if those were set.
+        """
+        run_id = request.match_info.get("run_id", "")
+        buffer = self._chat_run_buffers.get(run_id)
+        if buffer is None:
+            return web.json_response(
+                _openai_error(
+                    "Run not found or expired", err_type="invalid_request_error",
+                ),
+                status=404,
+            )
+        auth_err = self._check_chat_buffer_session(buffer, request)
+        if auth_err is not None:
+            return auth_err
+        try:
+            since = int(request.query.get("since", "0"))
+        except ValueError:
+            since = 0
+        return await self._stream_chat_buffer(request, buffer, since=since)
+
+    async def _handle_chat_completion_abort(
+        self, request: "web.Request",
+    ) -> "web.Response":
+        """Force-abort a running chat completion identified by ``run_id``.
+
+        Honoured both during the active stream and during the grace window.
+        Idempotent: aborting an already-terminal run is a no-op.
+        """
+        run_id = request.match_info.get("run_id", "")
+        buffer = self._chat_run_buffers.get(run_id)
+        if buffer is None:
+            return web.json_response(
+                _openai_error(
+                    "Run not found or expired", err_type="invalid_request_error",
+                ),
+                status=404,
+            )
+        auth_err = self._check_chat_buffer_session(buffer, request)
+        if auth_err is not None:
+            return auth_err
+        if not buffer.terminal:
+            if buffer.agent_ref and buffer.agent_ref[0] is not None:
+                try:
+                    buffer.agent_ref[0].interrupt("client abort")
+                except Exception:
+                    pass
+            if not buffer.agent_task.done():
+                try:
+                    buffer.agent_task.cancel()
+                except Exception:
+                    pass
+            buffer.mark_terminal("aborted")
+        return web.json_response({
+            "run_id": run_id,
+            "status": buffer.status,
+        })
 
     async def _write_sse_responses(
         self,
@@ -3631,6 +4090,29 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id in stale_statuses:
                 self._run_statuses.pop(run_id, None)
 
+            # Sweep abandoned chat-completion buffers whose grace watcher
+            # somehow missed cleaning up (defence in depth).  Terminal
+            # buffers are dropped by ``_chat_buffer_terminal_cleanup``;
+            # here we only catch buffers stuck non-terminal far past the
+            # grace + TTL window.
+            stale_chat_runs = []
+            mono_now = time.monotonic()
+            for run_id, buf in list(self._chat_run_buffers.items()):
+                age = mono_now - buf.created_at
+                if buf.terminal and age > CHAT_RUN_BUFFER_TTL_SECONDS * 2:
+                    stale_chat_runs.append(run_id)
+                elif (
+                    not buf.terminal
+                    and buf.subscriber_count <= 0
+                    and buf.last_subscriber_disconnected_at is not None
+                    and mono_now - buf.last_subscriber_disconnected_at
+                    > CHAT_RUN_GRACE_SECONDS * 4
+                ):
+                    stale_chat_runs.append(run_id)
+            for run_id in stale_chat_runs:
+                logger.info("[api_server] sweeping stale chat run %s", run_id)
+                self._chat_run_buffers.pop(run_id, None)
+
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
@@ -3654,6 +4136,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/tui-observation/sessions", self._handle_tui_observation_sessions)
             self._app.router.add_get("/v1/tui-observation/snapshot", self._handle_tui_observation_snapshot)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_get(
+                "/v1/chat/completions/runs/{run_id}/stream",
+                self._handle_chat_completion_resume,
+            )
+            self._app.router.add_post(
+                "/v1/chat/completions/runs/{run_id}/abort",
+                self._handle_chat_completion_abort,
+            )
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
