@@ -614,6 +614,368 @@ class TestCapabilitiesEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# /v1/runs endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRunsEndpoint:
+    @pytest.mark.asyncio
+    async def test_run_events_include_agent_activity_contract(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(
+                self,
+                tool_start_callback,
+                tool_complete_callback,
+                tool_progress_callback=None,
+            ):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.started",
+                        tool_name="terminal",
+                        preview="terminal ls",
+                        args={"cmd": "ls"},
+                    )
+                self.tool_start_callback(
+                    "call-terminal-1",
+                    "terminal",
+                    {"cmd": "ls"},
+                )
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.completed",
+                        tool_name="terminal",
+                    )
+                self.tool_complete_callback(
+                    "call-terminal-1",
+                    "terminal",
+                    {"cmd": "ls"},
+                    "done",
+                )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        tool_started_events = [event for event in events if event["event"] == "tool.started"]
+        tool_completed_events = [event for event in events if event["event"] == "tool.completed"]
+        assert len(tool_started_events) == 1
+        assert len(tool_completed_events) == 1
+
+        tool_event = next(event for event in events if event["event"] == "tool.started")
+        assert tool_event["activity"]["schema"] == "agent.activity.v1"
+        assert tool_event["activity"]["stream"] == "tool"
+        assert tool_event["activity"]["phase"] == "start"
+        assert tool_event["activity"]["runId"] == run_id
+        assert tool_event["activity"]["data"]["name"] == "terminal"
+        assert tool_event["activity"]["data"]["toolCallId"] == "call-terminal-1"
+
+        completed_tool_event = next(event for event in events if event["event"] == "tool.completed")
+        assert completed_tool_event["activity"]["schema"] == "agent.activity.v1"
+        assert completed_tool_event["activity"]["stream"] == "tool"
+        assert completed_tool_event["activity"]["phase"] == "completed"
+        assert completed_tool_event["activity"]["data"]["toolCallId"] == "call-terminal-1"
+
+        completed_event = next(event for event in events if event["event"] == "run.completed")
+        assert completed_event["activity"]["schema"] == "agent.activity.v1"
+        assert completed_event["activity"]["stream"] == "lifecycle"
+        assert completed_event["activity"]["phase"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_thinking_activity_for_reasoning(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_progress_callback=None):
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "reasoning.available",
+                        preview="Inspecting the request",
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        reasoning_event = next(event for event in events if event["event"] == "reasoning.available")
+        assert reasoning_event["activity"]["schema"] == "agent.activity.v1"
+        assert reasoning_event["activity"]["stream"] == "thinking"
+        assert reasoning_event["activity"]["phase"] == "update"
+        assert reasoning_event["activity"]["runId"] == run_id
+        assert reasoning_event["activity"]["data"]["statusLine"] == "Inspecting the request"
+
+    @pytest.mark.asyncio
+    async def test_tool_complete_without_id_drains_stale_metadata(self, adapter):
+        # Regression for codex review P2 on PR #4: when a provider-side
+        # tool.completed callback fires without a tool_call_id, the matching
+        # _tool_complete_callback used to early-return, leaving the metadata
+        # entry queued by _progress_callback in pending_tool_completions[name].
+        # The next well-formed completion for the same tool name then
+        # consumed the stale duration / is_error and corrupted the activity
+        # timeline. The fix drains the queue even when no ID is present.
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, tool_start_callback, tool_complete_callback, tool_progress_callback=None):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                # First, a provider emits tool.completed without a usable
+                # tool_call_id. _progress_callback queues stale metadata.
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=99.9,
+                    is_error=True,
+                )
+                self.tool_complete_callback(None, "terminal", {"cmd": "ls"}, "stale")
+
+                # Then a well-formed call: progress queues fresh metadata,
+                # tool_complete_callback emits one event using the FRESH data.
+                self.tool_start_callback("call-terminal-1", "terminal", {"cmd": "ls"})
+                self.tool_progress_callback(
+                    "tool.completed",
+                    tool_name="terminal",
+                    duration=0.25,
+                    is_error=False,
+                )
+                self.tool_complete_callback("call-terminal-1", "terminal", {"cmd": "ls"}, "ok")
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed_events = [event for event in events if event["event"] == "tool.completed"]
+        # Only the well-formed call should emit a completion event.
+        assert len(completed_events) == 1
+        assert completed_events[0]["tool"] == "terminal"
+        # Critically, the duration / error must come from the FRESH metadata
+        # (0.25 / False), not the stale entry (99.9 / True). If the stale
+        # entry had leaked through, this assertion would fail.
+        assert completed_events[0]["duration"] == 0.25
+        assert completed_events[0]["error"] is False
+        assert completed_events[0]["activity"]["data"]["toolCallId"] == "call-terminal-1"
+        assert completed_events[0]["activity"]["phase"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_events_include_interim_assistant_message_deltas(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(self, interim_assistant_callback=None):
+                self.interim_assistant_callback = interim_assistant_callback
+
+            def run_conversation(self, **kwargs):
+                if self.interim_assistant_callback:
+                    self.interim_assistant_callback(
+                        "まずリポジトリを確認します。",
+                        already_streamed=False,
+                    )
+                    self.interim_assistant_callback(
+                        "次に差分を確認します。",
+                        already_streamed=False,
+                    )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs.get("interim_assistant_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        deltas = [event["delta"] for event in events if event["event"] == "message.delta"]
+        assert deltas == [
+            "まずリポジトリを確認します。",
+            "\n\n次に差分を確認します。",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_events_merge_failed_tool_progress_metadata(self, adapter):
+        class FakeAgent:
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+            session_total_tokens = 2
+
+            def __init__(
+                self,
+                tool_start_callback,
+                tool_complete_callback,
+                tool_progress_callback=None,
+            ):
+                self.tool_start_callback = tool_start_callback
+                self.tool_complete_callback = tool_complete_callback
+                self.tool_progress_callback = tool_progress_callback
+
+            def run_conversation(self, **kwargs):
+                self.tool_start_callback(
+                    "call-terminal-failed",
+                    "terminal",
+                    {"cmd": "bad"},
+                )
+                if self.tool_progress_callback:
+                    self.tool_progress_callback(
+                        "tool.completed",
+                        tool_name="terminal",
+                        duration=0.25,
+                        is_error=True,
+                    )
+                self.tool_complete_callback(
+                    "call-terminal-failed",
+                    "terminal",
+                    {"cmd": "bad"},
+                    "boom",
+                )
+                return {"final_response": "done"}
+
+        app = _create_app(adapter)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=lambda **kwargs: FakeAgent(
+                    kwargs["tool_start_callback"],
+                    kwargs["tool_complete_callback"],
+                    kwargs.get("tool_progress_callback"),
+                ),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                payload = await resp.json()
+                run_id = payload["run_id"]
+
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed_tool_events = [event for event in events if event["event"] == "tool.completed"]
+        assert len(completed_tool_events) == 1
+
+        completed_tool_event = completed_tool_events[0]
+        assert completed_tool_event["run_id"] == run_id
+        assert completed_tool_event["error"] is True
+        assert completed_tool_event["duration"] == 0.25
+        assert completed_tool_event["activity"]["phase"] == "failed"
+        assert completed_tool_event["activity"]["data"]["toolCallId"] == "call-terminal-failed"
+        assert completed_tool_event["activity"]["data"]["isError"] is True
+        assert completed_tool_event["activity"]["data"]["duration"] == 0.25
+
+
+# ---------------------------------------------------------------------------
 # /v1/chat/completions endpoint
 # ---------------------------------------------------------------------------
 
@@ -680,6 +1042,49 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_surfaces_interim_assistant_commentary(self, adapter):
+        """Completed mid-turn assistant commentary is streamed before final completion."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("interim_assistant_callback")
+                if cb:
+                    cb("まずリポジトリを確認します。", already_streamed=False)
+                    cb("次に差分を確認します。", already_streamed=False)
+                return (
+                    {"final_response": "done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                import json as _json
+
+                content_chunks = []
+                for line in body.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = _json.loads(line[len("data: "):])
+                    content = chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+                    if content:
+                        content_chunks.append(content)
+                assert content_chunks == [
+                    "まずリポジトリを確認します。",
+                    "\n\n次に差分を確認します。",
+                ]
+                assert body.index('"content"') < body.index('"finish_reason": "stop"')
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
