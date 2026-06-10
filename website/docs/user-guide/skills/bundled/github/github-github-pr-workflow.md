@@ -167,6 +167,36 @@ The response JSON includes the PR `number` — save it for later commands.
 
 To create as a draft, add `"draft": true` to the JSON body.
 
+### Codex Review Gate (required after every push/PR)
+
+After pushing a branch or opening/updating a PR, request the GitHub Codex review
+and **wait for it** before reporting the work complete. This gate applies to the
+parent agent and to any coding subagent that pushed — a subagent that cannot
+poll must hand the gate back (PR URL, branch, head SHA), never skip it.
+
+```bash
+# 1. Pin the head commit you pushed, then request the review.
+HEAD_SHA=$(git rev-parse HEAD)
+gh pr comment <PR_NUMBER> --body '@codex review'
+
+# 2. Poll until chatgpt-codex-connector[bot] responds *for HEAD_SHA*. Reviews
+#    carry a commit_id, so a stale review from an earlier push round is never
+#    mistaken for a pass on the current code.
+gh api repos/$OWNER/$REPO/pulls/<PR_NUMBER>/reviews \
+  --jq "[.[] | select(.user.login==\"chatgpt-codex-connector[bot]\" and .commit_id==\"$HEAD_SHA\")]"
+# The bot may instead reply as an issue comment (no commit_id); then only count
+# comments created after you posted '@codex review' (compare created_at).
+```
+
+Gate rules:
+
+- A `pending`/queued state is **not a pass**. Keep polling until the bot
+  responds for the current head commit or a bounded timeout is reached.
+- "Bot responded" is not "review passed": read the findings and resolve P0/P1
+  items before closing the gate.
+- If polling times out, the bot is unreachable, or `gh`/GitHub is unavailable,
+  report the gate as **blocked/pending** — never as passed.
+
 ## 4. Monitoring CI Status
 
 ### Check CI Status

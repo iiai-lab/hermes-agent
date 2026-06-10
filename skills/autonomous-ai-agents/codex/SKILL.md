@@ -105,6 +105,41 @@ terminal(command="gh pr create --repo user/repo --head fix/issue-78 --title 'fix
 terminal(command="git worktree remove /tmp/issue-78", workdir="~/project")
 ```
 
+## GitHub PR Review Gate (`@codex review`)
+
+Whenever an implementation is pushed to a GitHub branch or a PR is opened/updated,
+the Codex PR review gate is **required** before the work can be reported complete.
+This applies to the parent agent **and** to any coding subagent that pushed — a
+subagent that cannot poll must hand the gate back, not skip it.
+
+```
+# 1. Pin the head commit you pushed, then post the review request as a PR
+#    comment — this triggers the GitHub Codex bot. Pinning the SHA stops a stale
+#    review from an earlier push round being mistaken for a pass on this code.
+terminal(command="git rev-parse HEAD", workdir="~/project")  # -> HEAD_SHA, e.g. a1b2c3d
+terminal(command="gh pr comment 42 --body '@codex review'", workdir="~/project")
+
+# 2. Poll until chatgpt-codex-connector[bot] responds *for HEAD_SHA*. Reviews
+#    carry a commit_id, so filter on it — never accept a review tied to an older
+#    commit as the current pass.
+terminal(command="gh api repos/{owner}/{repo}/pulls/42/reviews --jq '[.[] | select(.user.login==\"chatgpt-codex-connector[bot]\" and .commit_id==\"HEAD_SHA\")]'", workdir="~/project")
+#    The bot may instead answer as an issue comment (no commit_id); in that case
+#    only count comments whose createdAt is after you posted '@codex review', so
+#    an earlier round's comment is ignored.
+```
+
+Completion conditions:
+
+- The gate is **passed** only after `chatgpt-codex-connector[bot]` posts a review
+  or comment for the current head commit **and** its P0/P1 findings are resolved.
+- A `pending`/queued state is **not** a pass. Keep polling until the bot responds
+  or a bounded timeout is reached.
+- If polling times out, the bot is unreachable, or GitHub/`gh` is unavailable,
+  report the gate as **blocked/pending** — never as passed. Hand off the PR URL,
+  branch, and head SHA so polling can continue.
+- "Bot responded" is not the same as "review passed": read the findings and
+  resolve P0/P1 items before closing the gate.
+
 ## Batch PR Reviews
 
 ```
@@ -128,3 +163,4 @@ terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 5. **Background for long tasks** — use `background=true` and monitor with `process` tool
 6. **Don't interfere** — monitor with `poll`/`log`, be patient with long-running tasks
 7. **Parallel is fine** — run multiple Codex processes at once for batch work
+8. **GitHub PR review gate** — after any push/PR, post `@codex review` and poll for `chatgpt-codex-connector[bot]`; a `pending` state alone is never a pass (see [GitHub PR Review Gate](#github-pr-review-gate-codex-review))
