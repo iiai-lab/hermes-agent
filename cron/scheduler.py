@@ -773,13 +773,30 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     else:
         argv = [sys.executable, str(path)]
 
+    run_env = os.environ.copy()
+    # Make Python children emit UTF-8 regardless of the host locale so the
+    # decode below is symmetric (no-op for non-Python scripts). ":replace" so
+    # a lone surrogate in the child's own prints degrades to a replacement
+    # char instead of crashing the child with UnicodeEncodeError. Forced (not
+    # setdefault): the parent ALWAYS decodes these pipes as UTF-8, so an
+    # inherited non-UTF-8 PYTHONIOENCODING would silently garble every
+    # non-ASCII byte again (Codex PR#8 P2).
+    run_env["PYTHONIOENCODING"] = "utf-8:replace"
+
     try:
+        # encoding= must stay explicit: with bare text=True the pipes are
+        # decoded with the locale codec (cp932 on Japanese Windows), the
+        # reader thread dies on the first UTF-8 multibyte sequence, and the
+        # job's entire stdout/stderr is silently lost.
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=script_timeout,
             cwd=str(path.parent),
+            env=run_env,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
