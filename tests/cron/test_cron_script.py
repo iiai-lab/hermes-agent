@@ -144,6 +144,62 @@ class TestRunJobScript:
         assert success is True
         assert output == ""
 
+    def test_script_utf8_output_survives_cp932_locale(self, cron_env):
+        """UTF-8 Japanese/emoji stdout must survive on native Windows.
+
+        Regression (2026-06-12): subprocess.run(text=True) without an explicit
+        encoding decodes the child's pipes with the locale codec (cp932 on
+        Japanese Windows). Hermes ops scripts reconfigure their stdout to
+        UTF-8, so the reader thread hit UnicodeDecodeError, swallowed BOTH
+        streams, and every failing script job reported only "Script exited
+        with code N" with no stderr — masking the real error.
+        """
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "jp_report.py"
+        script.write_text(
+            textwrap.dedent("""\
+                import sys
+                for _stream in (sys.stdout, sys.stderr):
+                    try:
+                        _stream.reconfigure(encoding="utf-8")
+                    except (AttributeError, ValueError):
+                        pass
+                print("\\u26a0 \\u505c\\u6ede: \\u65e5\\u672c\\u8a9e\\u30ec\\u30dd\\u30fc\\u30c8 \\U0001f6e1\\ufe0f")
+            """),
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert "停滞" in output          # 停滞
+        assert "⚠" in output                # ⚠
+
+    def test_script_utf8_stderr_survives_on_failure(self, cron_env):
+        """Same regression for stderr: a failing script's UTF-8 Japanese
+        error message must reach the cron output instead of vanishing."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "jp_fail.py"
+        script.write_text(
+            textwrap.dedent("""\
+                import sys
+                for _stream in (sys.stdout, sys.stderr):
+                    try:
+                        _stream.reconfigure(encoding="utf-8")
+                    except (AttributeError, ValueError):
+                        pass
+                print("\\u81f4\\u547d\\u7684: \\u8a2d\\u5b9a\\u30d5\\u30a1\\u30a4\\u30eb\\u304c\\u898b\\u3064\\u304b\\u308a\\u307e\\u305b\\u3093", file=sys.stderr)
+                sys.exit(1)
+            """),
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "exited with code 1" in output
+        assert "致命的" in output    # 致命的
+
     def test_script_timeout(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
