@@ -56,3 +56,18 @@ def test_pending_is_not_a_pass_condition_stated() -> None:
     """The 'pending alone is never a pass' rule must be explicit, not implied."""
     text = SKILL_MD.read_text(encoding="utf-8").lower()
     assert "not a pass" in text or "never a pass" in text or "never as passed" in text
+
+
+@pytest.mark.parametrize("doc", [SKILL_MD, GENERATED_DOC], ids=["skill_md", "generated_doc"])
+def test_review_polling_example_interpolates_head_sha(doc: Path) -> None:
+    text = doc.read_text(encoding="utf-8")
+    assert 'commit_id=="HEAD_SHA"' not in text
+    assert 'commit_id==\\"HEAD_SHA\\"' not in text
+    assert "$HEAD_SHA" in text
+
+
+@pytest.mark.parametrize("doc", [SKILL_MD, GENERATED_DOC], ids=["skill_md", "generated_doc"])
+def test_issue_comment_fallback_uses_rest_timestamp_name(doc: Path) -> None:
+    text = doc.read_text(encoding="utf-8")
+    assert "created_at" in text
+    assert "createdAt" not in text

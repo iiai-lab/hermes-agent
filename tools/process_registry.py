@@ -584,9 +584,16 @@ class ProcessRegistry:
             # leak as untracked background processes.
             try:
                 if not _IS_WINDOWS:
+                    import psutil
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError, OSError):
+                        parent = psutil.Process(proc.pid)
+                        for child in parent.children(recursive=True):
+                            try:
+                                child.kill()
+                            except psutil.NoSuchProcess:
+                                pass
+                        parent.kill()
+                    except (psutil.NoSuchProcess, PermissionError, OSError):
                         proc.kill()
                 else:
                     proc.kill()

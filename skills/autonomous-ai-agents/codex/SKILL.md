@@ -116,15 +116,15 @@ subagent that cannot poll must hand the gate back, not skip it.
 # 1. Pin the head commit you pushed, then post the review request as a PR
 #    comment — this triggers the GitHub Codex bot. Pinning the SHA stops a stale
 #    review from an earlier push round being mistaken for a pass on this code.
-terminal(command="git rev-parse HEAD", workdir="~/project")  # -> HEAD_SHA, e.g. a1b2c3d
+terminal(command="HEAD_SHA=$(git rev-parse HEAD); printf '%s\n' \"$HEAD_SHA\"", workdir="~/project")
 terminal(command="gh pr comment 42 --body '@codex review'", workdir="~/project")
 
 # 2. Poll until chatgpt-codex-connector[bot] responds *for HEAD_SHA*. Reviews
 #    carry a commit_id, so filter on it — never accept a review tied to an older
 #    commit as the current pass.
-terminal(command="gh api repos/{owner}/{repo}/pulls/42/reviews --jq '[.[] | select(.user.login==\"chatgpt-codex-connector[bot]\" and .commit_id==\"HEAD_SHA\")]'", workdir="~/project")
+terminal(command="HEAD_SHA=$(git rev-parse HEAD); gh api repos/{owner}/{repo}/pulls/42/reviews --jq \"[.[] | select(.user.login==\\\"chatgpt-codex-connector[bot]\\\" and .commit_id==\\\"$HEAD_SHA\\\")]\"", workdir="~/project")
 #    The bot may instead answer as an issue comment (no commit_id); in that case
-#    only count comments whose createdAt is after you posted '@codex review', so
+#    only count comments whose created_at is after you posted '@codex review', so
 #    an earlier round's comment is ignored.
 ```
 
