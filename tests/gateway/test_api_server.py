@@ -26,6 +26,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _ChatRunBuffer,
     _IdempotencyCache,
     _CORS_HEADERS,
     _derive_chat_session_id,
@@ -3697,4 +3698,88 @@ class TestBuildResponseConversationHistory:
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "fallback-ack"},
         ]
+
+
+# ---------------------------------------------------------------------------
+# _ChatRunBuffer (resumable chat-completion stream support)
+# ---------------------------------------------------------------------------
+
+
+class TestChatRunBuffer:
+    def _make_buffer(self) -> _ChatRunBuffer:
+        # Stub stream_q / agent_task: the unit tests below don't exercise the
+        # producer, only the in-memory append/replay/wait_more semantics.
+        loop = asyncio.new_event_loop()
+        try:
+            future = loop.create_future()
+        finally:
+            loop.close()
+        return _ChatRunBuffer(
+            completion_id="chatcmpl-buf-test",
+            model="hermes-agent",
+            created=1_700_000_000,
+            stream_q=None,
+            agent_ref=[None],
+            agent_task=future,  # never awaited in these tests
+            session_id="sess-1",
+            gateway_session_key=None,
+        )
+
+    def test_append_event_prefixes_id_and_advances_seq(self):
+        buf = self._make_buffer()
+        assert buf.seq == 0
+        buf.append_event(b"data: hello\n\n")
+        buf.append_event(b"data: world\n\n")
+        assert buf.seq == 2
+        assert buf.chunks[0].startswith(b"id: 0\n")
+        assert buf.chunks[1].startswith(b"id: 1\n")
+        assert b"data: hello\n\n" in buf.chunks[0]
+        assert b"data: world\n\n" in buf.chunks[1]
+
+    def test_mark_terminal_sets_status_and_is_idempotent(self):
+        buf = self._make_buffer()
+        assert buf.terminal is False
+        buf.mark_terminal("done")
+        assert buf.terminal is True
+        assert buf.status == "done"
+        # Second call must not change status.
+        buf.mark_terminal("aborted")
+        assert buf.status == "done"
+
+    def test_wait_more_returns_immediately_when_terminal(self):
+        async def run() -> None:
+            buf = self._make_buffer()
+            buf.mark_terminal("done")
+            await asyncio.wait_for(buf.wait_more(timeout=1.0), timeout=2.0)
+
+        asyncio.run(run())
+
+    def test_wait_more_wakes_on_append(self):
+        async def run() -> None:
+            buf = self._make_buffer()
+
+            async def producer() -> None:
+                await asyncio.sleep(0.01)
+                buf.append_event(b"data: x\n\n")
+
+            await asyncio.gather(
+                buf.wait_more(timeout=2.0),
+                producer(),
+            )
+            assert buf.seq == 1
+
+        asyncio.run(run())
+
+    def test_wait_more_times_out_when_idle(self):
+        async def run() -> None:
+            buf = self._make_buffer()
+            start = time.monotonic()
+            await buf.wait_more(timeout=0.05)
+            elapsed = time.monotonic() - start
+            # Timeout fires; buffer is unchanged and waiters list empty.
+            assert buf.seq == 0
+            assert elapsed >= 0.04
+
+        asyncio.run(run())
+
 
