@@ -838,10 +838,52 @@ class AuthorityConnection:
         if self._voice_stop_replay(ref, params) or await self._typed_voice_stop(ref, params):
             self._record_voice_stop(ref, params)
             return {'voice_stopped': True}
+        ref = await self._pre_gateway_dispatch_local_turn(ref, params)
         # The interactive WS is the one surface a restart's after-turn wait admits (#139041).
         receipt = await self.authority.submit(self.actor, self.submission(ref, params),
                                               queue_while_restarting=self._operator is True)
         return asdict(receipt)
+
+    async def _pre_gateway_dispatch_local_turn(self, ref, params):
+        """``pre_gateway_dispatch`` for a viewer's own prompt, before the admission commits.
+
+        Messaging fires the hook in ``_hm_admit_event``. A Desktop, classic CLI or TUI
+        prompt never reached it, so a policy subscribed for every user conversation
+        could not stamp or reset this lane. No text, a hidden display, a missing
+        source and every non-local platform stay on their own path. A runner without
+        the lane entry (an older gateway, a bare test double) keeps the legacy submit.
+
+        A reset the hook performs advances this chat's receipt
+        (``bindings.reset_target`` / ``advance_local_target``). The drain runs the
+        prompt on that tip, and a later viewer of the same logical session follows
+        the same receipt, so this method does not attach again. Compression
+        ``lineage.tip`` does not walk a ``session_reset`` child.
+        """
+        from gateway.platforms.event import MessageEvent
+        from gateway.run_inbound_hooks import lane_hook_of
+
+        text = params.get('text')
+        if not isinstance(text, str) or not text.strip() or params.get('display_kind') == 'hidden':
+            return ref
+        hook = lane_hook_of(getattr(self.authority, 'runner', None))
+        if hook is None:
+            return ref
+        try:
+            source = self.authority.sessions[ref.session_id].source
+        except KeyError:
+            return ref
+        if source is None or getattr(source, 'platform', None) != Platform.LOCAL:
+            return ref
+        event = MessageEvent(text=text, source=source)
+        try:
+            result = await hook(event, source)
+        except Exception as exc:  # health: allow BLE001 -- a lane hook must not stop dispatch; the messaging wrapper fail-opens the same way
+            logger.warning('pre_gateway_dispatch lane hook failed: %s', exc)
+            return ref
+        if result is None:
+            logger.warning('pre_gateway_dispatch dropped a local prompt for %s', ref.session_id)
+            raise AuthorityRefusal('permission_denied')
+        return ref
 
     def _voice_stop_key(self, ref, params):
         request_id = params.get('submission_id') or params.get('input_id')
