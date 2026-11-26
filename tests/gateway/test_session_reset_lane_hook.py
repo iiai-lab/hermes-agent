@@ -445,6 +445,69 @@ async def test_api_without_a_lane_hook_keeps_legacy_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_api_compression_lineage_hooks_the_origin_route_key(monkeypatch):
+    """A header already resolved to a compression tip still keys the lane by the origin.
+
+    The routing entry stays on ``dm:<origin>`` and only its ``session_id`` is the
+    tip. The plugin must see that key, the stamp must land on it, a reset must
+    adopt the new id, and a compression-only turn must still echo the client id.
+    """
+    from gateway.platforms.api_server_openai_routes import _echo_chat_session_id
+
+    origin = "api-header"
+    tip = "comp-tip-1"
+    store = _RouteStore()
+    key = build_session_key(SessionSource(
+        platform=Platform.API_SERVER, chat_id=origin, user_id="api", chat_type="dm"))
+    tip_key = build_session_key(SessionSource(
+        platform=Platform.API_SERVER, chat_id=tip, user_id="api", chat_type="dm"))
+    store.entries[key] = _entry(tip)
+    seen = []
+    reset = {"on": False}
+
+    async def _plugin(name, **kwargs):
+        route = kwargs["gateway"]._session_key_for_source(kwargs["event"].source)
+        seen.append(route)
+        if reset["on"]:
+            kwargs["session_store"].lookup_by_session_key(route).session_id = "reset-child"
+            return []
+        kwargs["session_store"].set_session_metadata(route, "srp_last_user_inbound", "2026-11-26T06:00:00")
+        return []
+
+    runner, hook = _runner(store, _plugin)
+    monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", hook)
+    adapter = _adapter("sk-secret")
+    adapter.gateway_runner = runner
+    reloaded = []
+
+    async def _reload(session_id):
+        reloaded.append(session_id)
+        return [{"role": "user", "content": "from-new"}]
+
+    adapter._reload_chat_history = _reload
+    prior = [{"role": "user", "content": "earlier"}]
+    landed, history, moved, dropped = await adapter._apply_chat_lane_policy(tip, prior, "hello", origin)
+    assert dropped is None
+    assert seen == [key]
+    assert key != tip_key
+    assert tip_key not in store.entries
+    assert store.entries[key].metadata["srp_last_user_inbound"] == "2026-11-26T06:00:00"
+    assert store.meta[(key, "srp_last_user_inbound")] == "2026-11-26T06:00:00"
+    assert landed == tip and moved is False and history is prior and reloaded == []
+    # #13437: the turn runs on the tip, the response still names the id the client sent.
+    assert _echo_chat_session_id(origin, landed, policy_moved=moved, result_session=tip) == origin
+
+    reset["on"] = True
+    landed, history, moved, dropped = await adapter._apply_chat_lane_policy(
+        tip, list(prior), "hello again", origin)
+    assert dropped is None
+    assert seen[-1] == key
+    assert landed == "reset-child" and moved is True
+    assert reloaded == ["reset-child"]
+    assert history == [{"role": "user", "content": "from-new"}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.usefixtures("authority_cwd_in_tmp")
 async def test_local_reset_prompt_and_a_later_viewer_follow_the_receipt_tip(tmp_path, monkeypatch):
     """A policy reset advances the local receipt. The prompt and a stale viewer follow that tip."""

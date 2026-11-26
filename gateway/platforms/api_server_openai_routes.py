@@ -944,7 +944,13 @@ class OpenAICompatRoutesMixin:
         hook = lane_hook_of(runner)
         if hook is None:
             return session_id, history, False, None
-        source = _api_turn_source(session_id, _api_request_profile.get())
+        # The route key is the client header, or the derived fingerprint when
+        # there is no header. Compression moves only the entry's session_id
+        # onto the tip and leaves the key on that origin, so a tip chat_id
+        # misses lookup_by_session_key. Landed resolution below still reads
+        # the entry the hook just wrote.
+        source = _api_turn_source(
+            str(provided_session_id or session_id), _api_request_profile.get())
         text = user_message if isinstance(user_message, str) else ""
         try:
             outcome = await hook(MessageEvent(text=text, source=source), source)
