@@ -483,6 +483,69 @@ def test_gateway_status_skips_pending_source_update_completion(tmp_path, monkeyp
     assert pending.is_file(), "a status query must leave the update tail for `hermes gateway restart`"
 
 
+@pytest.mark.parametrize("argv", [
+    ["kanban", "show", "t_x"],
+    ["kanban", "list"],
+    ["kanban", "ls"],
+    ["kanban", "--board", "ops", "show", "t_x"],
+    ["kanban", "--board=ops", "list"],
+    ["-p", "work", "kanban", "--board", "ops", "ls"],
+    ["kanban", "stats"],
+    ["kanban", "runs", "t_x"],
+    ["kanban", "log", "t_x"],
+    ["kanban", "assignees"],
+    ["kanban", "diagnostics"],
+    ["kanban", "diag"],
+    ["kanban", "attachments", "t_x"],
+    ["kanban", "notify-list"],
+    ["kanban", "context", "t_x"],
+    ["kanban", "tail", "t_x"],
+    ["kanban", "watch"],
+])
+def test_read_only_kanban_skips_pending_source_update_completion(
+    tmp_path, monkeypatch, completion_tail, argv,
+):
+    """A board read leaves a pending tail for `hermes update` (2026-11-27).
+
+    ``kanban show`` ran that tail, including the desktop rebuild. Options that
+    belong to ``kanban`` (``--board``) sit in front of the verb after
+    ``command_argv`` has removed only top-level flags.
+    """
+    import pm
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    pending = venv_sync.arm_completion(root)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **_kw: pytest.fail("kanban read started a dependency sync"))
+
+    assert venv_sync.prepare_launch(root, argv) is None
+    assert completion_tail == []
+    assert pending.is_file(), "a kanban read must leave the update tail for `hermes update`"
+
+
+@pytest.mark.parametrize("argv", [
+    ["kanban", "complete", "t_x"],
+    ["kanban", "unblock", "t_x"],
+    ["kanban", "--board", "ops", "complete", "t_x"],
+])
+def test_kanban_mutation_still_finishes_pending_source_update(
+    tmp_path, monkeypatch, completion_tail, argv,
+):
+    """A kanban write is not the read exemption: a pending tail still runs."""
+    import pm
+    from hermes_cli import _launchers
+
+    root = _self_checkout(tmp_path, monkeypatch)
+    pending = venv_sync.arm_completion(root)
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _, **__: Path(sys.executable))
+    monkeypatch.delenv("HERMES_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+
+    assert venv_sync.prepare_launch(root, argv) is None
+    assert len(completion_tail) == 1
+    assert not pending.is_file()
+
+
 @pytest.mark.parametrize("marker,value,owed_by_cli", [
     ("HERMES_SUPERVISED_CHILD", "1", True),
     ("HERMES_S6_SUPERVISED_CHILD", "true", True),
