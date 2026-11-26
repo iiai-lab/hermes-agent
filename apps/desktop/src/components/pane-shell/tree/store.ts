@@ -12,6 +12,7 @@ import { registry } from '@/contrib/registry'
 import { translateNow } from '@/i18n'
 import { LAYOUT_KEYS } from '@/lib/layout-persistence'
 import { Codecs } from '@/lib/persisted'
+import { revealTraceEnabled, traceReveal } from '@/lib/reveal-trace'
 import { writeKey } from '@/lib/storage'
 import { type InterfaceMode, modeLayout } from '@/store/interface-mode'
 import { notify } from '@/store/notifications'
@@ -77,6 +78,35 @@ export const $layoutTree = modeLayout.atom<LayoutNode | null>(
   ),
   true
 )
+
+// Opt-in (hermes.debug.reveal): report each group's active pane when it
+// changes, whoever wrote the tree. The first write with the flag on is only
+// the baseline, so a line is a from→to change. Off resets that baseline.
+let tracedActivePanes: ReadonlyMap<string, string> | null = null
+
+$layoutTree.listen(tree => {
+  if (!tree || !revealTraceEnabled()) {
+    tracedActivePanes = null
+
+    return
+  }
+
+  const previous = tracedActivePanes
+  const next = new Map(groupLeafIds(tree).map(groupId => [groupId, findGroup(tree, groupId)?.active ?? '']))
+  tracedActivePanes = next
+
+  if (!previous) {
+    return
+  }
+
+  for (const [groupId, active] of next) {
+    const from = previous.get(groupId)
+
+    if (from !== active) {
+      traceReveal('reveal-trace', { event: 'active', from: from ?? null, groupId, to: active })
+    }
+  }
+})
 
 /**
  * Which layout preset the current tree came from; `'custom'` after the user
@@ -1223,6 +1253,8 @@ export function treeSideOfPane(paneId: string): TreeSide | null {
  * open its side, unhide it, and bring it to the front of its group.
  */
 export function revealTreePane(paneId: string) {
+  traceReveal('reveal-trace', { event: 'reveal', paneId })
+
   // Reveal beats a Close: un-dismiss and let adoption put the pane back.
   if ($dismissedPanes.get().has(paneId)) {
     setDismissed(paneId, false)

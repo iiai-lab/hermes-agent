@@ -22,6 +22,7 @@ import {
   setSessionArchived
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { _resetRevealTraceForTests, REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $backgroundStatusBySession, type ComposerStatusItem } from '@/store/composer-status'
@@ -1893,6 +1894,38 @@ describe('resumeSession failure recovery', () => {
     expect(requestGateway).not.toHaveBeenCalled()
     expect($resumeFailedSessionId.get()).toBeNull()
     expect($selectedStoredSessionId.get()).toBeNull()
+  })
+
+  it('logs a resume trace at entry when hermes.debug.reveal is on', async () => {
+    const logLine = vi.fn()
+    const previous = window.hermesDesktop
+
+    window.hermesDesktop = { ...(previous ?? {}), logLine } as never
+    window.localStorage.setItem(REVEAL_TRACE_KEY, '1')
+    _resetRevealTraceForTests()
+    $removedSessionIds.set(new Set(['stored-1']))
+
+    try {
+      await runResume(
+        vi.fn(async () => {
+          throw new Error('unused')
+        })
+      )
+
+      const traced = logLine.mock.calls.flatMap(call => {
+        const match = /^\[selected-trace win=main\] (.*)$/.exec(String(call[0]))
+
+        return match ? [JSON.parse(match[1]) as Record<string, unknown>] : []
+      })
+
+      expect(traced).toContainEqual(
+        expect.objectContaining({ event: 'resume', replaceRoute: true, storedSessionId: 'stored-1' })
+      )
+    } finally {
+      window.hermesDesktop = previous
+      window.localStorage.removeItem(REVEAL_TRACE_KEY)
+      _resetRevealTraceForTests()
+    }
   })
 
   it.each([

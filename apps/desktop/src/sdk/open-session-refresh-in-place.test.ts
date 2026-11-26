@@ -18,6 +18,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { _resetRevealTraceForTests, REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
 import type { ProfileInfo } from '@/types/hermes'
 
 vi.mock('@/app/chat/session-view', async () => {
@@ -223,5 +224,42 @@ describe('host.openSession refreshInPlace — background re-resume never navigat
     await host.openSession('bot-chat-ops', { profile: 'ops', refreshInPlace: true })
 
     expect(setSessionOwnerHint).toHaveBeenCalledWith('bot-chat-ops', expect.objectContaining({ profile: 'ops' }))
+  })
+})
+
+describe('host.openSession reveal trace (hermes.debug.reveal)', () => {
+  function selectedLines(logLine: { mock: { calls: unknown[][] } }): Record<string, unknown>[] {
+    return logLine.mock.calls.flatMap(call => {
+      const match = /^\[selected-trace win=main\] (.*)$/.exec(String(call[0]))
+
+      return match ? [JSON.parse(match[1]) as Record<string, unknown>] : []
+    })
+  }
+
+  it('logs plugin-open-session only while the flag is on', async () => {
+    const logLine = vi.fn()
+    const previous = window.hermesDesktop
+
+    window.hermesDesktop = { ...(previous ?? {}), logLine } as never
+    window.localStorage.removeItem(REVEAL_TRACE_KEY)
+    _resetRevealTraceForTests()
+
+    try {
+      await host.openSession('bot-chat-ops', { profile: 'ops', refreshInPlace: true })
+      expect(selectedLines(logLine)).toEqual([])
+
+      window.localStorage.setItem(REVEAL_TRACE_KEY, '1')
+      _resetRevealTraceForTests()
+      logLine.mockClear()
+
+      await host.openSession('bot-chat-ops', { profile: 'ops', refreshInPlace: true })
+      expect(selectedLines(logLine)).toContainEqual(
+        expect.objectContaining({ event: 'plugin-open-session', storedSessionId: 'bot-chat-ops' })
+      )
+    } finally {
+      window.hermesDesktop = previous
+      window.localStorage.removeItem(REVEAL_TRACE_KEY)
+      _resetRevealTraceForTests()
+    }
   })
 })

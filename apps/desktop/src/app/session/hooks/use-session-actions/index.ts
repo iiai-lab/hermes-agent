@@ -32,6 +32,7 @@ import {
 import { markReasoningEffortPending } from '@/lib/chat-runtime'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { purgeInFlightTurnJournals, recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
+import { traceReveal } from '@/lib/reveal-trace'
 import { latestSessionTodoSnapshot } from '@/lib/todos'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests, clearClarifyRequest } from '@/store/clarify'
@@ -1165,6 +1166,8 @@ export function useSessionActions({
       capturedOwner?: SessionProfileRoute,
       options?: ResumeAttemptOptions
     ) => {
+      traceReveal('selected-trace', { event: 'resume', replaceRoute, storedSessionId })
+
       // Delete/archive tombstones the durable id before the route flips, and
       // requestSessionResume already refuses to queue for a doomed id. This is
       // the actuator-side half of the same rule: a resume that was queued

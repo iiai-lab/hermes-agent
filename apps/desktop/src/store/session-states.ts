@@ -35,6 +35,7 @@ import { resolveRememberedActivePane, workspaceScopeKey } from '@/components/pan
 import type { WorkspaceMode } from '@/contrib/types'
 import { dropBrowserProfilePrefs, migrateBrowserProfilePrefs } from '@/lib/browser-profile-prefs'
 import { finalizeInterruptedMessages, sealOpenToolParts } from '@/lib/chat-messages'
+import { traceReveal } from '@/lib/reveal-trace'
 import { tileFocusStampOnFocusChange } from '@/lib/session-timer-since'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
@@ -3019,8 +3020,10 @@ export function markSelectionRestore() {
 $selectedStoredSessionId.listen(selected => {
   const restoring = selectionRestoreInFlight
   selectionRestoreInFlight = false
+  const homes = selectionHomesToWorkspace(selected, $sessionTiles.get())
+  traceReveal('selected-trace', { event: 'selected', homes, restoring, selected })
 
-  if (restoring || !selectionHomesToWorkspace(selected, $sessionTiles.get())) {
+  if (restoring || !homes) {
     return
   }
 

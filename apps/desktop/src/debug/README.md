@@ -109,3 +109,16 @@ The real cost is elsewhere — see `topRenders` in the scenario's `detail`.
 `$sessionStates` notified 1,200 times with **10 listeners** (fan-out 12,000)
 and zero wasted notifies, so the publishing side is honest; the waste is in
 components that re-render on a parent commit without their own inputs changing.
+
+## Reveal trace (`hermes.debug.reveal`)
+
+Not part of the dev-only counters above: this flag is opt-in and works in a
+normal build. From the DevTools console,
+`localStorage.setItem('hermes.debug.reveal','1')` turns it on with no reload,
+and `localStorage.removeItem('hermes.debug.reveal')` turns it off. The flag is
+cached for up to a second, so either change can take that long to apply.
+Lines land in
+`~/.hermes/logs/desktop.log` as `[reveal-trace win=…]` and
+`[selected-trace win=…]`, each with an ISO `at`, the event name, and the
+caller `stack`. Implementation: `src/lib/reveal-trace.ts`. It is for chasing
+a Bot new tab that flashes on, then the previous surface takes the front back.
