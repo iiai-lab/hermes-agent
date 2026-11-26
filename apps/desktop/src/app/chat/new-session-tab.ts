@@ -13,7 +13,14 @@ let pendingDraftCreate: null | Promise<void> = null
 // Bot tabs have no blank draft to front, so a second press while session.create
 // is still in flight would mint another session (and, under load, an orphan).
 // Separate from the Sessions latch: a slow bot create must not block "+".
-let pendingBotDraftCreate: null | Promise<void> = null
+// One entry per workspace owner — bot A's in-flight create must not swallow
+// "+" aimed at bot B. Cleared only when the promise that installed it settles.
+const pendingBotDraftCreates = new Map<string, Promise<void>>()
+
+/** @internal Tests: drop in-flight bot latches so a held create cannot leak. */
+export function _resetPendingBotDraftCreatesForTests(): void {
+  pendingBotDraftCreates.clear()
+}
 
 /**
  * The tab-strip "+" and ⌘T: open a new session as its own tab (stacked into
@@ -35,7 +42,7 @@ export function openNewSessionTab(openNewSessionTile: OpenNewSessionTile): void 
   const workspaceNewSessionTarget = $workspaceNewSessionTarget.get()
 
   if ($workspaceMode.get() === 'bots' && workspaceNewSessionTarget?.kind === 'route' && workspaceOwnerKey) {
-    if (pendingBotDraftCreate) {
+    if (pendingBotDraftCreates.has(workspaceOwnerKey)) {
       return
     }
 
@@ -48,12 +55,12 @@ export function openNewSessionTab(openNewSessionTile: OpenNewSessionTile): void 
         workspaceOwnerKey
       }
     }).finally(() => {
-      if (pendingBotDraftCreate === botCreate) {
-        pendingBotDraftCreate = null
+      if (pendingBotDraftCreates.get(workspaceOwnerKey) === botCreate) {
+        pendingBotDraftCreates.delete(workspaceOwnerKey)
       }
     })
 
-    pendingBotDraftCreate = botCreate
+    pendingBotDraftCreates.set(workspaceOwnerKey, botCreate)
 
     return
   }

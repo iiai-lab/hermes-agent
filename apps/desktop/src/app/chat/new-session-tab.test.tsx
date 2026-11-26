@@ -10,7 +10,7 @@ import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import type { DesktopProfileRoute } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
+import { _resetRevealTraceForTests, REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
 import { clearSessionDraft, freshDraftScope } from '@/store/composer'
 import { $defaultProfileRoute, setDefaultProfile } from '@/store/default-profile'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -21,7 +21,7 @@ import * as states from '@/store/session-states'
 
 import { $workspaceIsPage } from '../routes'
 
-import { openNewSessionTab } from './new-session-tab'
+import { _resetPendingBotDraftCreatesForTests, openNewSessionTab } from './new-session-tab'
 
 vi.mock('@/store/profile', async original => ({
   ...(await original<Record<string, unknown>>()),
@@ -62,8 +62,9 @@ beforeAll(() => {
 const OLD = { connectionId: 'old-host', profile: 'old-profile' }
 const NEW = { connectionId: 'new-host', profile: 'new-profile' }
 
-/** The real hook, with the window's runtime cache backed by the real store. */
-function mountPlus() {
+/** The real hook, with the window's runtime cache backed by the real store.
+ *  `onOpen` fires only when the "+" actually calls `openNewSessionTile`. */
+function mountPlus(onOpen?: () => void) {
   const ref = <T,>(current: T) => ({ current })
 
   const updateSessionState = (id: string, updater: (state: ClientSessionState) => ClientSessionState) => {
@@ -95,7 +96,21 @@ function mountPlus() {
     })
   )
 
-  return () => openNewSessionTab(result.current.openNewSessionTile)
+  return () => {
+    const openNewSessionTile = result.current.openNewSessionTile
+
+    if (!onOpen) {
+      openNewSessionTab(openNewSessionTile)
+
+      return
+    }
+
+    openNewSessionTab((...args) => {
+      onOpen()
+
+      return openNewSessionTile(...args)
+    })
+  }
 }
 
 /** Each session.create answers only when the test releases it. */
@@ -134,6 +149,8 @@ function reset() {
   $newChatRoute.set(null)
   $newChatProfile.set(null)
   $newChatConnectionId.set(null)
+  _resetPendingBotDraftCreatesForTests()
+  _resetRevealTraceForTests()
   window.localStorage.clear()
 }
 
@@ -303,6 +320,36 @@ describe('Bot Mode "+" / Ctrl+T while session.create is in flight', () => {
     await act(async () => releases.forEach(release => release()))
     await flush()
   })
+
+  it('does not drop a press for another bot while one bot create is still in flight', async () => {
+    enterBotWorkspace()
+    const releases = holdCreates()
+    let opens = 0
+
+    const plus = mountPlus(() => {
+      opens += 1
+    })
+
+    const nova = { connectionId: 'bot-host', profile: 'nova' }
+
+    plus()
+    await flush()
+    setWorkspaceScope('bots', 'bot:nova', { kind: 'route', route: nova })
+    plus()
+    await flush()
+    enterBotWorkspace()
+    plus()
+    await flush()
+
+    expect(opens).toBe(2)
+    expect(creates().map(call => call.slice(0, 2))).toEqual([
+      [BOT_ROUTE.connectionId, BOT_ROUTE.profile],
+      [nova.connectionId, nova.profile]
+    ])
+
+    await act(async () => releases.forEach(release => release()))
+    await flush()
+  })
 })
 
 describe('opt-in reveal trace (hermes.debug.reveal)', () => {
@@ -332,6 +379,8 @@ describe('opt-in reveal trace (hermes.debug.reveal)', () => {
 
   it('records the reveal, the active pane change, and the selection when the flag is 1', async () => {
     window.localStorage.setItem(REVEAL_TRACE_KEY, '1')
+    // beforeEach's layout write already cached "off"; drop it so this setItem is visible.
+    _resetRevealTraceForTests()
     const lines = captureLogLines()
 
     await openBotTab()
