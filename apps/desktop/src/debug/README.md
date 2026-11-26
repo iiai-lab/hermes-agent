@@ -114,8 +114,10 @@ components that re-render on a parent commit without their own inputs changing.
 
 Not part of the dev-only counters above: this flag is opt-in and works in a
 normal build. From the DevTools console,
-`localStorage.setItem('hermes.debug.reveal','1')` turns it on with no reload;
-`localStorage.removeItem('hermes.debug.reveal')` turns it off. Lines land in
+`localStorage.setItem('hermes.debug.reveal','1')` turns it on with no reload,
+and `localStorage.removeItem('hermes.debug.reveal')` turns it off. The flag is
+cached for up to a second, so either change can take that long to apply.
+Lines land in
 `~/.hermes/logs/desktop.log` as `[reveal-trace win=…]` and
 `[selected-trace win=…]`, each with an ISO `at`, the event name, and the
 caller `stack`. Implementation: `src/lib/reveal-trace.ts`. It is for chasing

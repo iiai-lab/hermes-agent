@@ -10,7 +10,8 @@ import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import type { DesktopProfileRoute } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { _resetRevealTraceForTests, REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
+import { _resetRevealTraceForTests, REVEAL_TRACE_KEY, revealTraceEnabled } from '@/lib/reveal-trace'
+import { onPersistenceEvent } from '@/lib/storage'
 import { clearSessionDraft, freshDraftScope } from '@/store/composer'
 import { $defaultProfileRoute, setDefaultProfile } from '@/store/default-profile'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -353,6 +354,10 @@ describe('Bot Mode "+" / Ctrl+T while session.create is in flight', () => {
 })
 
 describe('opt-in reveal trace (hermes.debug.reveal)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   function captureLogLines() {
     const logLine = vi.fn()
     window.hermesDesktop = { ...window.hermesDesktop, logLine } as never
@@ -409,5 +414,38 @@ describe('opt-in reveal trace (hermes.debug.reveal)', () => {
     expect(
       traced.filter(Boolean).every(entry => typeof entry?.at === 'string' && typeof entry?.stack === 'string')
     ).toBe(true)
+  })
+
+  it('serves the cached flag for under a second, then reads the new storage value', () => {
+    vi.useFakeTimers()
+    // beforeEach already cached "off" on the real clock. Drop that once so the
+    // read below is the cache under test, and leave it in place while time moves.
+    _resetRevealTraceForTests()
+
+    const reads: (null | string)[] = []
+
+    const stop = onPersistenceEvent(event => {
+      if (event.key === REVEAL_TRACE_KEY && event.op === 'read') {
+        reads.push(event.value)
+      }
+    })
+
+    try {
+      expect(revealTraceEnabled()).toBe(false)
+      expect(reads).toEqual([null])
+
+      window.localStorage.setItem(REVEAL_TRACE_KEY, '1')
+      vi.advanceTimersByTime(999)
+
+      expect(revealTraceEnabled()).toBe(false)
+      expect(reads).toEqual([null])
+
+      vi.advanceTimersByTime(1)
+
+      expect(revealTraceEnabled()).toBe(true)
+      expect(reads).toEqual([null, '1'])
+    } finally {
+      stop()
+    }
   })
 })

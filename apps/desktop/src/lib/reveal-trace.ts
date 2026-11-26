@@ -5,9 +5,10 @@
  * `localStorage['hermes.debug.reveal'] === '1'`. The value is cached and
  * re-read at most once a second: a same-window DevTools `setItem` does not
  * fire `storage`, so an event-updated cache would miss it, but a reload is
- * still unnecessary. Off writes nothing and does not call `readKey` on the
- * hot path. Renderer console lines below error level never reach desktop.log,
- * hence the explicit `logLine` IPC (same door as identity-trace).
+ * still unnecessary. Off writes nothing. Refreshing the cache calls `readKey`
+ * at most once a second, including while the flag is off. Renderer console
+ * lines below error level never reach desktop.log, hence the explicit
+ * `logLine` IPC (same door as identity-trace).
  */
 
 import { readKey } from './storage'
