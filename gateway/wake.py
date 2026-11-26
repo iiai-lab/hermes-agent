@@ -133,7 +133,7 @@ def _local_receipt(source: Any, display_text: str) -> dict:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       display_text: str = "") -> None:
+                       display_text: str = "", wake_kinds: Optional[list] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
@@ -141,6 +141,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
     ``display_text`` (collapsed to one line of at most 200 characters; blank means none) becomes the
     card on a LOCAL source's authority-admitted wake, which an idle classic CLI needs to open the turn.
+    ``wake_kinds`` names the statuses this wake reports, so delivery can tell a completion from a
+    notice the board has since overtaken.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
@@ -151,6 +153,8 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
             from gateway.session_automation import admit_route_wake
             from persistence.core.errors import AuthorityRefusal
             category = {"notification_category": notification_category} if notification_category != "result" else {}
+            if wake_kinds:
+                category = category | {"kanban_wake_v1": {"kinds": sorted(set(wake_kinds))}}
             try:
                 if await admit_route_wake(runner, adapter, source, text, "kanban-wake",
                                           category | _local_receipt(source, display_text)):

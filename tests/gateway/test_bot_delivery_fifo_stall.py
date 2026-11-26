@@ -13,6 +13,7 @@ busy chat never spends a turn on a card nobody can act on.
 """
 from types import SimpleNamespace
 
+import asyncio
 import pytest
 
 from gateway.config import GatewayConfig, Platform
@@ -48,11 +49,16 @@ async def _authority(tmp_path, monkeypatch, executed):
     return store, authority
 
 
-def _notice(authority, text, request_id='notice-1', identity='proc-1'):
+def _notice(authority, text, request_id='notice-1', identity='proc-1', kinds=None):
+    """Admit a gateway notice. ``kinds`` is the wake's own status set, which the notifier now sends
+    as ``kanban_wake_v1`` and the delivery check reads to tell a completion from a stale notice."""
+    descriptor = {'identity': identity, 'owner': 's'}
+    if kinds is not None:
+        descriptor['kanban_wake_v1'] = {'kinds': list(kinds)}
     row, _created = authority.persistence.admissions.admit(
         epoch=authority.epoch, principal_id='automation:agent:main:local:dm:bot-chat', session_id='s',
         request_id=request_id,
-        payload={'text': text, 'local_automation_v1': {'identity': identity, 'owner': 's'}})
+        payload={'text': text, 'local_automation_v1': descriptor})
     return row
 
 
@@ -205,16 +211,20 @@ def _finish_card(kb, kbc, task_id, status):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['archived', 'done'])
 async def test_a_notice_whose_card_finishes_while_it_waits_is_dropped(tmp_path, monkeypatch, status):
-    """Queued while the card was live, delivered after it finished: the FIFO drops it, no turn runs."""
+    """Queued while the card was live, delivered after it finished: the FIFO drops it, no turn runs.
+
+    ``done`` only drops a notice that reports something other than the completion: this notice says
+    ``blocked``, so a card that was later completed left it stale (``test_a_completion_notice_for_a_
+    done_card_is_delivered`` covers the completion's own notice, which must run)."""
     executed = []
     store, authority = await _authority(tmp_path, monkeypatch, executed)
     try:
         kb, kbc = _kanban_board(tmp_path, monkeypatch)
         task_id = _card(kb, kbc, 'card')
-        text = f'[kanban] Task {task_id} is running.\nTitle: card\nBoard: default'
+        text = f'[kanban] Task {task_id} blocked; needs attention.\nTitle: card\nBoard: default'
         real_schedule, held = authority._schedule, []
         authority._schedule = lambda ref: held.append(ref)
-        notice = _notice(authority, text, identity=f'kanban:{task_id}')
+        notice = _notice(authority, text, identity=f'kanban:{task_id}', kinds=['blocked'])
         assert _rows(authority) == [('notice-1', 'queued', None)]  # it IS in the FIFO
         _finish_card(kb, kbc, task_id, status)
 
@@ -225,6 +235,131 @@ async def test_a_notice_whose_card_finishes_while_it_waits_is_dropped(tmp_path, 
         assert _rows(authority) == [(notice.request_id, 'terminal', 'completed')]
     finally:
         store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_a_completion_notice_for_a_done_card_is_delivered(tmp_path, monkeypatch):
+    """The completion wake is written into a card that is already ``done`` (``complete_task`` sets
+    the status and the ``completed`` event in one transaction), so ``done`` alone must not drop the
+    one notice the owner is waiting for."""
+    executed = []
+    store, authority = await _authority(tmp_path, monkeypatch, executed)
+    try:
+        kb, kbc = _kanban_board(tmp_path, monkeypatch)
+        task_id = _card(kb, kbc, 'card')
+        _finish_card(kb, kbc, task_id, 'done')
+        text = f'[kanban] Task {task_id} completed.\nTitle: card\nBoard: default'
+        real_schedule, held = authority._schedule, []
+        authority._schedule = lambda ref: held.append(ref)
+        _notice(authority, text, identity=f'kanban:{task_id}', kinds=['completed'])
+
+        await _run_drain(authority, real_schedule)
+        await async_wait_until(lambda: _rows(authority)[0][1] == 'terminal', timeout=30,
+                               what='the notice to leave the FIFO')
+        assert executed == [text]
+        assert _rows(authority) == [('notice-1', 'terminal', 'completed')]
+    finally:
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_a_completion_notice_for_an_archived_card_is_dropped(tmp_path, monkeypatch):
+    """Archiving is what nobody can act on any more, whatever the notice reports."""
+    executed = []
+    store, authority = await _authority(tmp_path, monkeypatch, executed)
+    try:
+        kb, kbc = _kanban_board(tmp_path, monkeypatch)
+        task_id = _card(kb, kbc, 'card')
+        _finish_card(kb, kbc, task_id, 'archived')
+        text = f'[kanban] Task {task_id} completed.\nTitle: card\nBoard: default'
+        real_schedule, held = authority._schedule, []
+        authority._schedule = lambda ref: held.append(ref)
+        _notice(authority, text, identity=f'kanban:{task_id}', kinds=['completed'])
+
+        await _run_drain(authority, real_schedule)
+        await async_wait_until(lambda: _rows(authority)[0][1] == 'terminal', timeout=30,
+                               what='the notice to leave the FIFO')
+        assert executed == []
+    finally:
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kinds', [None, []])
+async def test_a_notice_without_a_wake_status_set_is_delivered(tmp_path, monkeypatch, kinds):
+    """An older producer (or another route) carries no ``kanban_wake_v1``. That cannot prove the
+    notice stale, so it is delivered: a late notice beats a lost one."""
+    executed = []
+    store, authority = await _authority(tmp_path, monkeypatch, executed)
+    try:
+        kb, kbc = _kanban_board(tmp_path, monkeypatch)
+        task_id = _card(kb, kbc, 'card')
+        _finish_card(kb, kbc, task_id, 'done')
+        text = f'[kanban] Task {task_id} completed.\nTitle: card\nBoard: default'
+        real_schedule, held = authority._schedule, []
+        authority._schedule = lambda ref: held.append(ref)
+        _notice(authority, text, identity=f'kanban:{task_id}', kinds=kinds)
+
+        await _run_drain(authority, real_schedule)
+        await async_wait_until(lambda: _rows(authority)[0][1] == 'terminal', timeout=30,
+                               what='the notice to leave the FIFO')
+        assert executed == [text]
+    finally:
+        store.close_all_db_handles()
+
+
+def test_the_producer_metadata_survives_into_the_admitted_descriptor():
+    """The wake's status set is carried by the producer metadata the notifier passes, and the
+    automation snapshot stores it under ``kanban_wake_v1`` — the key the delivery check reads.
+    Without this hop the completion notice is indistinguishable from the stale one it is not."""
+    from gateway.kanban_watchers_notifier import WAKE_KINDS
+    from gateway.session_automation import kanban_wake_kinds
+    assert kanban_wake_kinds({}) == {}
+    assert kanban_wake_kinds({'kanban_wake_v1': {'kinds': ['completed']}}) == \
+        {'kanban_wake_v1': {'kinds': ['completed']}}
+    assert 'completed' in WAKE_KINDS  # the set the producer draws from, not a copy beside it
+    with pytest.raises(AuthorityRefusal, match='invalid_params'):
+        kanban_wake_kinds({'kanban_wake_v1': {'kinds': ['not-a-wake-kind']}})
+
+
+@pytest.mark.asyncio
+async def test_a_wake_admitted_by_the_notifier_carries_its_status_into_the_row(tmp_path, monkeypatch):
+    """The whole hop the drop rule depends on: ``deliver_wake(wake_kinds=...)`` → ``admit_route_wake``
+    → the automation snapshot → the row's descriptor. A break anywhere here silently turns every
+    completion notice back into a stale one."""
+    from gateway.wake import deliver_wake
+    from tests.gateway.test_session_end_delegations import _local
+
+    runner, authority, ref, _ = await _local(tmp_path, monkeypatch)
+    live = authority.sessions[ref.session_id]
+    adapter = runner._delivery_adapter_for(live.source)
+    await deliver_wake(adapter, text='[kanban] notice', session_id=ref.session_id, source=live.source,
+                       wake_kinds=['completed'])
+    rows = authority.persistence.admissions.list(session_id=ref.session_id, pending_only=False)
+    assert [row.payload['local_automation_v1']['kanban_wake_v1'] for row in rows] == [
+        {'kinds': ['completed']}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('card_status,notice,delivered', [
+    ('archived', {'kinds': ['completed']}, False),   # archived: nobody can act on it
+    ('archived', None, False),
+    ('done', {'kinds': ['completed']}, True),        # the completion's own notice
+    ('done', {'kinds': ['blocked']}, False),         # stale: the card moved on
+    ('done', None, True),                            # unreadable notice: deliver
+    ('running', {'kinds': ['blocked']}, True),       # card still live: deliver
+])
+async def test_the_drop_rule_for_a_named_card(tmp_path, monkeypatch, card_status, notice, delivered):
+    """The whole rule in one table: only ``archived``, and ``done`` with a notice that reports
+    something else, drops the notice. Every unreadable/absent case delivers."""
+    from gateway.session_automation import finished_card_notice
+    _kanban_board(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    task_id = _card(kb, kbc, 'card')
+    if card_status != 'running':
+        _finish_card(kb, kbc, task_id, card_status)
+    assert await asyncio.to_thread(finished_card_notice, task_id, notice) is not delivered
 
 
 @pytest.mark.asyncio

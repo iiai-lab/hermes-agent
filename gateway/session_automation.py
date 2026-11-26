@@ -354,9 +354,18 @@ def _owner(runner, event, authority):
     return entry
 
 
-# A Kanban status notice names its card. Once that card is ``archived`` or ``done`` the notice only
-# describes work nobody can act on any more: dropped right before delivery instead of spending a turn.
-_FINISHED_CARD_STATUSES = frozenset({'archived', 'done'})
+# A Kanban status notice names its card. An ``archived`` card is beyond anyone's reach, and a
+# notice about it is dropped right before delivery instead of spending a turn. A ``done`` card is
+# not: the COMPLETION wake is itself written while the card is already done, so ``done`` alone drops
+# every "your card finished" notice the owner is waiting for. A done card only silences a notice
+# that was written for something else (a ``blocked`` or ``crashed`` wake whose card has since been
+# completed): the wake carries its own status set (``kanban_wake_v1``) and a notice without one
+# delivers, because a late notice beats a lost one.
+_ARCHIVED_CARD_STATUS = 'archived'
+_DONE_CARD_STATUS = 'done'
+# The one wake kind that reports the card's own completion. The kind set itself is the notifier's
+# (``_WAKE_KINDS``), imported at use so a status added there reaches this gate too.
+_COMPLETED_WAKE_KIND = 'completed'
 # The gateway's own wake notice, whose first line is ``"[kanban] Task t_1a2b3c4d completed."``
 # (``gateway.kanban.wake.message``). Anchored at the message's start on purpose: a card's own work
 # turn says "work kanban task" and carries ``kanban_card_v1``, and no message somebody composed —
@@ -379,8 +388,39 @@ def notice_task_id(row):
     return None if match is None else match.group(1)
 
 
-def finished_card_notice(task_id):
-    """Whether *task_id* is already ``archived`` or ``done`` on the board this gateway delivers for.
+def kanban_wake_kinds(metadata):
+    """The wake's own status set, validated, keyed for the descriptor: ``{'kanban_wake_v1':
+    {'kinds': [...]}}`` of known ``_WAKE_KINDS``, or ``{}`` when the producer sent none. A gate, not
+    decoration — it is what tells a completion notice apart from a ``blocked`` one whose card has
+    since been completed."""
+    notice = metadata.get('kanban_wake_v1')
+    if notice is None:
+        return {}
+    from gateway.kanban_watchers_notifier import WAKE_KINDS
+    kinds = notice.get('kinds') if isinstance(notice, dict) and set(notice) == {'kinds'} else None
+    if (not isinstance(kinds, list) or not kinds
+            or not all(isinstance(kind, str) and kind in WAKE_KINDS for kind in kinds)):
+        raise AuthorityRefusal('invalid_params')
+    return {'kanban_wake_v1': {'kinds': sorted(set(kinds))}}
+
+
+def _notice_is_completion(notice):
+    """Whether a delivered notice reports the card's own completion. A notice with no status set —
+    absent, empty, or of a shape this build does not know — is not provably stale, so it counts as
+    a completion and is delivered: a late notice beats a lost one."""
+    kinds = notice.get('kinds') if isinstance(notice, dict) else None
+    if not isinstance(kinds, list) or not kinds:
+        return True
+    return _COMPLETED_WAKE_KIND in kinds
+
+
+def finished_card_notice(task_id, notice=None):
+    """Whether the notice naming *task_id* should still be dropped rather than delivered.
+
+    An ``archived`` card is beyond anyone's reach, so its notice goes. A ``done`` card only drops a
+    notice that says something else: the COMPLETION wake is written into a card that is already
+    done, so ``done`` plus a completion notice is the notice the owner is waiting for. *notice* is
+    the wake's own status set (``kanban_wake_v1``); missing, malformed or unreadable, it delivers.
 
     A card the board does not hold (another board, an older build's export) is not finished as far
     as this check can tell, and an unreadable board proves nothing either: both deliver the notice.
@@ -390,10 +430,14 @@ def finished_card_notice(task_id):
     try:
         with kbc.connect_closing() as conn:
             row = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
-    except (OSError, sqlite3.Error, kbc.KanbanDbCorruptError) as exc:
+    except (OSError, ValueError, sqlite3.Error, kbc.KanbanDbCorruptError) as exc:
+        # ValueError: an archived board or an unknown slug refuses to be recreated
+        # (``_refuse_dead_board_resurrection``), which proves as little as an unreadable file.
         logger.debug('kanban notice: board unreadable (%s); delivering the notice', exc)
         return False
-    return row is not None and row[0] in _FINISHED_CARD_STATUSES
+    if row is None:
+        return False
+    return row[0] == _ARCHIVED_CARD_STATUS or (row[0] == _DONE_CARD_STATUS and not _notice_is_completion(notice))
 
 
 def automation_notification_metadata(metadata):
@@ -430,7 +474,7 @@ def automation_display_metadata(metadata):
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
     'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
-    'completion_wakes_parent', 'completion_resumes_parent', 'requester_user_id'})
+    'completion_wakes_parent', 'completion_resumes_parent', 'requester_user_id', 'kanban_wake_v1'})
 
 
 def admission_display(payload):
@@ -550,7 +594,7 @@ def snapshot_automation(authority, adapter, event, identity):
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise AuthorityRefusal('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | _tick_metadata(event.metadata) | kanban_wake_kinds(event.metadata))
     entry = _owner(runner, event, authority)
     from gateway.session_detached import detached_route_of
     if event.source.platform == Platform.LOCAL or detached_route_of(event.source):
@@ -667,6 +711,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
+    descriptor.update(kanban_wake_kinds(event.metadata))
     if 'completion_wakes_parent' in event.metadata:
         # A failed async delegation: the parent must act on it, so it runs as a turn even when no viewer
         # is attached (gateway/session_completion_notes.py). Only ``True`` is stored, so an older

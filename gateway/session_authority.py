@@ -1385,16 +1385,25 @@ class SessionAuthority:
             await asyncio.sleep(_CLAIM_RETRY_MIN_S)
 
     async def _finished_card_notice(self, ref, live, row):
-        """The turn's reply when *row* is a Kanban notice whose card is already finished (archived
-        or done), else None. Checked here, at the claim, so a notice already sitting in the FIFO is
-        also dropped: the board may have moved on while it waited. Nothing is sent to the chat and no
-        model turn runs; the row settles like any notice that answered without work.
+        """The turn's reply when *row* is a Kanban notice nobody can act on any more (its card is
+        ``archived``, or ``done`` while the notice says something other than the completion), else
+        None. Checked here, at the claim, so a notice already sitting in the FIFO is also dropped:
+        the board may have moved on while it waited. Nothing is sent to the chat and no model turn
+        runs; the row settles like any notice that answered without work.
 
-        The text check is inline (every ordinary turn pays only a regex over a payload already in
-        memory); the board read runs off the loop and only when a notice actually names a card."""
+        A notice for a card that is ``done`` AND reports that completion is delivered — that notice
+        is the completion's own wake, written after the card was already done. The text check is
+        inline (every ordinary turn pays only a regex over a payload already in memory); the board
+        read runs off the loop and only when a notice actually names a card."""
         from gateway.session_automation import finished_card_notice, notice_task_id
         task_id = notice_task_id(row)
-        if task_id is None or not await asyncio.to_thread(finished_card_notice, task_id):
+        if task_id is None:
+            return None
+        payload = row.get('payload') or {}
+        descriptor = (payload.get('local_automation_v1')
+                      or (payload.get('native_text_v1') or {}).get('automation') or {})
+        notice = descriptor.get('kanban_wake_v1')
+        if not await asyncio.to_thread(finished_card_notice, task_id, notice):
             return None
         import logging
         logging.getLogger(__name__).info(

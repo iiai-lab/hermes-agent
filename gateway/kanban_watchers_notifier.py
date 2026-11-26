@@ -48,6 +48,9 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
+# The same set under a public name: the automation snapshot validates a wake's own status set
+# against it (``session_automation.kanban_wake_kinds``), so a kind added here is accepted there.
+WAKE_KINDS = frozenset(_WAKE_KINDS)
 
 
 def diagnostic_event(ev) -> bool:
@@ -659,7 +662,8 @@ class _KanbanNotification:
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
-                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
+                                   notification_category="diagnostic" if self.wake_diagnostic else "result",
+                                   wake_kinds=self.wake_kinds)
             self._log_woke()
             return
         from gateway.session import SessionSource
@@ -689,7 +693,7 @@ class _KanbanNotification:
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
                                notification_category="diagnostic" if self.wake_diagnostic else "result",
-                               display_text=self.synth.partition("\n")[0])
+                               display_text=self.synth.partition("\n")[0], wake_kinds=self.wake_kinds)
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
