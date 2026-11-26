@@ -45,6 +45,28 @@ async def _stop_exec_tree(proc) -> None:
         await asyncio.wait_for(proc.wait(), timeout=5)
 
 
+def lane_hook_of(runner):
+    """The runner's ``pre_gateway_dispatch_lane_hook`` when this build defines one.
+
+    An older gateway has no entry, and a ``MagicMock`` runner grows the name on
+    access. Both keep the lane's legacy dispatch. A function assigned on the
+    instance (a test double) counts; an auto-created mock does not.
+    """
+    if runner is None:
+        return None
+    defined = False
+    for cls in type(runner).__mro__:
+        if "pre_gateway_dispatch_lane_hook" in cls.__dict__:
+            defined = True
+            break
+    if not defined:
+        defined = "pre_gateway_dispatch_lane_hook" in getattr(runner, "__dict__", {})
+    if not defined:
+        return None
+    hook = getattr(runner, "pre_gateway_dispatch_lane_hook", None)
+    return hook if callable(hook) else None
+
+
 def _carry_replied_voice_answer(event, rewritten, new_text: str) -> None:
     """``dataclasses.replace`` drops the adapter's private typed-answer attribute, and without it a
     clarify reads the replied-to voice note's speech as the answer. Carry it: the plugin's rewritten
@@ -127,6 +149,20 @@ class GatewayInboundHooksMixin:
             if _action == "allow":
                 break
         return event
+
+    async def pre_gateway_dispatch_lane_hook(
+        self, event: MessageEvent, source: SessionSource
+    ) -> Optional[MessageEvent]:
+        """``pre_gateway_dispatch`` once for a non-messaging lane's inbound user turn.
+
+        Messaging fires the hook from ``_hm_admit_event`` (webhook and relay from
+        ``admit_producer``). A local viewer prompt and an API-server chat turn never
+        reached either, so a plugin subscribed for every user conversation could not
+        stamp or reset those lanes. Each lane calls this before its admission commits:
+        a ``skip`` drops uncommitted input, and a reset the plugin performs is visible
+        to the lane before it binds the turn. None = drop, else the (maybe rewritten) event.
+        """
+        return await self._hm_pre_gateway_dispatch_hook(event, source)
 
     def _hm_quick_commands(self) -> dict:
         """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""

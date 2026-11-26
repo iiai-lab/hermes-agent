@@ -757,6 +757,58 @@ def _parse_responses_input(raw_input: Any) -> tuple:
     return input_messages, None
 
 
+def _api_turn_source(session_id: str, profile: Optional[str]):
+    """The ``api_server`` source a chat-completions turn is keyed by.
+
+    ``chat_id`` is the id this request resolved (the header id, or the derived
+    fingerprint). ``SessionStore`` keeps that key across ``reset_session`` and
+    only the entry's ``session_id`` moves, so the policy plugin's
+    ``_session_key_for_source`` finds ``agent:main:api_server:dm:<id>``.
+    """
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    return SessionSource(
+        platform=Platform.API_SERVER, chat_id=str(session_id), user_id="api",
+        chat_type="dm", profile=profile or None)
+
+
+def _route_session_after_hook(runner, source, session_id: str) -> str:
+    """The route entry's session after the lane hook, else *session_id*.
+
+    A policy reset rotates the entry in place. The derived id and a client
+    header do not change across that boundary, and compression resume does not
+    walk a ``session_reset`` child, so the turn has to adopt the entry.
+    """
+    store = getattr(runner, "session_store", None)
+    key_for = getattr(runner, "_session_key_for_source", None)
+    if store is None or not callable(key_for):
+        return session_id
+    try:
+        key = key_for(source)
+        entry = store.lookup_by_session_key(key) if key else None
+    except Exception as exc:  # health: allow BLE001 -- a route read must not stop the turn; the hook itself fail-opens
+        logger.warning("pre_gateway_dispatch route lookup failed: %s", exc)
+        return session_id
+    landed = getattr(entry, "session_id", None)
+    return landed if isinstance(landed, str) and landed else session_id
+
+
+def _echo_chat_session_id(provided, session_id, *, policy_moved: bool, result_session=None) -> str:
+    """Session id a chat-completions response names.
+
+    A header client keeps the id it sent, unless the lane hook moved the route
+    onto a reset tip. A header-less client keeps the id the turn resolved.
+    """
+    if policy_moved:
+        return result_session or session_id
+    if provided:
+        return provided
+    if result_session is None:
+        return session_id
+    return result_session
+
+
 def _parse_conversation_history(raw_history: Any) -> tuple:
     """Explicit Responses ``conversation_history`` -> ``(history, error_response_or_None)``."""
     from gateway.platforms.api_server import (
@@ -862,11 +914,126 @@ class OpenAICompatRoutesMixin:
         agent_task.add_done_callback(_done)
         return agent_task, agent_ref
 
+    async def _reload_chat_history(self, session_id: str) -> list:
+        """Transcript of *session_id* after a policy reset, or ``[]`` when it cannot be read.
+
+        The header path loads history before the hook. A reset ends that row; the
+        turn must not reopen it by replaying the ended transcript."""
+        try:
+            store = self._store_beside(await self._ensure_store_async())
+            if store is None:
+                return []
+            return [m.as_openai_message() for m in await store.aio.messages.read_conversation(session_id)]
+        except Exception as exc:  # health: allow BLE001 -- history reload is presentation of an already-accepted reset; the turn still runs
+            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            return []
+
+    async def _apply_chat_lane_policy(self, session_id, history, user_message, provided_session_id):
+        """``(session_id, history, policy_moved, error_response_or_None)`` for one chat turn.
+
+        Runs ``pre_gateway_dispatch`` once after session resolution and before
+        agent dispatch. A ``skip`` is a 403 and nothing is dispatched. A hook
+        that raises fail-opens (the turn keeps *session_id*). A route the hook
+        left on another session — the reset tip — is the one the turn runs on.
+        """
+        from gateway.platforms.api_server import _api_request_profile, _error_response
+        from gateway.platforms.event import MessageEvent
+        from gateway.run_inbound_hooks import lane_hook_of
+
+        runner = getattr(self, "gateway_runner", None)
+        hook = lane_hook_of(runner)
+        if hook is None:
+            return session_id, history, False, None
+        source = _api_turn_source(session_id, _api_request_profile.get())
+        text = user_message if isinstance(user_message, str) else ""
+        try:
+            outcome = await hook(MessageEvent(text=text, source=source), source)
+        except Exception as exc:  # health: allow BLE001 -- a lane hook must not stop dispatch; the messaging wrapper fail-opens the same way
+            logger.warning("pre_gateway_dispatch lane hook failed: %s", exc)
+            return session_id, history, False, None
+        if outcome is None:
+            logger.warning("pre_gateway_dispatch dropped an api turn for session %s", session_id)
+            return session_id, history, False, _error_response(
+                "Request dropped by pre_gateway_dispatch", 403, code="pre_gateway_dispatch_skip")
+        landed = _route_session_after_hook(runner, source, session_id)
+        if landed == session_id:
+            return session_id, history, False, None
+        if provided_session_id:
+            history = await self._reload_chat_history(landed)
+        return landed, history, True, None
+
+    async def _resolve_chat_completion_session(
+        self, request, system_prompt, conversation_messages, user_message, history,
+    ):
+        """Resolve the chat turn's session, then the lane policy.
+
+        ``(session_id, history, gateway_session_key, provided_session_id, policy_moved, error)``.
+        ``error`` is a response and the rest is unused. ``policy_moved`` means the
+        lane hook left the route on a different session than the one resolved here.
+        """
+        from gateway.platforms.api_server import (
+            _api_request_profile, _derive_chat_session_id, _error_response, _invalid_request)
+
+        # X-Hermes-Session-Key scopes long-term memory per channel; independent of
+        # X-Hermes-Session-Id (the key persists across transcripts, the id rotates on /new).
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return None, history, None, "", False, key_err
+        # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
+        # requires a configured API key or any client could read history by guessing ids.
+        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if provided_session_id:
+            if not self._api_key:
+                logger.warning(
+                    "Session continuation via X-Hermes-Session-Id rejected: "
+                    "no API key configured.  Set API_SERVER_KEY to enable "
+                    "session continuity.")
+                return None, history, gateway_session_key, provided_session_id, False, _error_response(
+                    "Session continuation requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature.", 403)
+            # Same guard as the native gateway: ids are interpolated into on-disk filenames.
+            from gateway.session import _is_path_unsafe
+            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
+                return None, history, gateway_session_key, provided_session_id, False, _invalid_request(
+                    "Invalid session ID")
+            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
+                return None, history, gateway_session_key, provided_session_id, False, _invalid_request(
+                    "Session ID too long")
+            session_id = provided_session_id
+            try:
+                store = self._store_beside(await self._ensure_store_async())
+                if store is not None:
+                    # #98619/#13437: a client-addressed id from before a compression rotation
+                    # must adopt the live continuation tip — history loads from it, the turn and
+                    # the wake target bind it, and a detached delegation delivery row persisted
+                    # on the tip is what this continuation consumes. Same canonical resolution
+                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
+                    from gateway.platforms.api_server_runs import _resolve_live_session_id
+                    session_id = await _resolve_live_session_id(self, provided_session_id)
+                    history = [m.as_openai_message() for m in await store.aio.messages.read_conversation(session_id)]
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
+        else:
+            # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
+            # one Hermes session; namespaced by the routed profile (#123989).
+            first_user = next(
+                (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
+            session_id = _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())
+            session_id, lookup_error = await self._implicit_chat_session(request, session_id)
+            if lookup_error is not None:
+                return session_id, history, gateway_session_key, provided_session_id, False, lookup_error
+        session_id, history, policy_moved, dropped = await self._apply_chat_lane_policy(
+            session_id, history, user_message, provided_session_id)
+        if dropped is not None:
+            return session_id, history, gateway_session_key, provided_session_id, False, dropped
+        return session_id, history, gateway_session_key, provided_session_id, policy_moved, None
+
     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         from gateway.platforms.api_server import (
-            ThreadSafeAsyncQueue, _api_request_profile, _chat_usage_payload, _coerce_request_bool,
-            _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
+            ThreadSafeAsyncQueue, _chat_usage_payload, _coerce_request_bool,
+            _content_has_visible_payload, _error_response, _invalid_request,
             _openai_error, _redact_api_error_text, _resolve_media_to_data_urls)
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
@@ -891,52 +1058,11 @@ class OpenAICompatRoutesMixin:
         if not _content_has_visible_payload(user_message):
             return _invalid_request("No user message found in messages")
 
-        # X-Hermes-Session-Key scopes long-term memory per channel; independent of
-        # X-Hermes-Session-Id (the key persists across transcripts, the id rotates on /new).
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
-        # X-Hermes-Session-Id continues an existing session (history from state.db, not the body);
-        # requires a configured API key or any client could read history by guessing ids.
-        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
-            if not self._api_key:
-                logger.warning(
-                    "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity.")
-                return _error_response("Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature.", 403)
-            # Same guard as the native gateway: ids are interpolated into on-disk filenames.
-            from gateway.session import _is_path_unsafe
-            if re.search(r'[\r\n\x00]', provided_session_id) or _is_path_unsafe(provided_session_id):
-                return _invalid_request("Invalid session ID")
-            if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
-                return _invalid_request("Session ID too long")
-            session_id = provided_session_id
-            try:
-                store = self._store_beside(await self._ensure_store_async())
-                if store is not None:
-                    # #98619/#13437: a client-addressed id from before a compression rotation
-                    # must adopt the live continuation tip — history loads from it, the turn and
-                    # the wake target bind it, and a detached delegation delivery row persisted
-                    # on the tip is what this continuation consumes. Same canonical resolution
-                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
-                    from gateway.platforms.api_server_runs import _resolve_live_session_id
-                    session_id = await _resolve_live_session_id(self, provided_session_id)
-                    history = [m.as_openai_message() for m in await store.aio.messages.read_conversation(session_id)]
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
-        else:
-            # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
-            # one Hermes session; namespaced by the routed profile (#123989).
-            first_user = next(
-                (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
-            session_id = _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())
-            session_id, lookup_error = await self._implicit_chat_session(request, session_id)
-            if lookup_error is not None:
-                return lookup_error
+        session_id, history, gateway_session_key, provided_session_id, policy_moved, session_error = (
+            await self._resolve_chat_completion_session(
+                request, system_prompt, conversation_messages, user_message, history))
+        if session_error is not None:
+            return session_error
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -999,10 +1125,13 @@ class OpenAICompatRoutesMixin:
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
             # so a rotation mid-turn (after these headers are prepared) never changes what the
             # client should send next — it re-sends the same id and the tip resolution above
-            # finds whatever session is live by then.
+            # finds whatever session is live by then. A policy reset is the exception: compression
+            # resume does not walk a session_reset child, so the echo names the tip the hook left.
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=(provided_session_id or session_id),
+                agent_task, agent_ref,
+                session_id=_echo_chat_session_id(
+                    provided_session_id, session_id, policy_moved=policy_moved),
                 gateway_session_key=gateway_session_key)
 
         async def _compute_completion():
@@ -1024,9 +1153,11 @@ class OpenAICompatRoutesMixin:
         budget_exhausted = _budget_exhausted(result)
         finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, budget_exhausted=budget_exhausted)
         # Same #13437 identity contract as the SSE path: an explicit-header client is echoed
-        # the stable id it sent; a fingerprint-derived (header-less) turn keeps reporting the
-        # id the agent actually resolved, so headerless clients still learn where the turn went.
-        response_headers = {"X-Hermes-Session-Id": (provided_session_id or result.get("session_id", session_id))}
+        # the stable id it sent, unless the lane hook moved the route onto a reset tip.
+        # A fingerprint-derived (header-less) turn keeps reporting the id the agent resolved.
+        response_headers = {"X-Hermes-Session-Id": _echo_chat_session_id(
+            provided_session_id, session_id, policy_moved=policy_moved,
+            result_session=result.get("session_id", session_id))}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         # Hard fail (no usable text AND a real failure) -> 502 OpenAI error envelope so SDK
