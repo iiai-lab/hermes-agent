@@ -6,9 +6,11 @@ import { useSessionActions } from '@/app/session/hooks/use-session-actions'
 import type { ClientSessionState } from '@/app/types'
 import * as model from '@/components/pane-shell/tree/model'
 import * as tree from '@/components/pane-shell/tree/store'
+import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { registry } from '@/contrib/registry'
 import type { DesktopProfileRoute } from '@/global'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { REVEAL_TRACE_KEY } from '@/lib/reveal-trace'
 import { clearSessionDraft, freshDraftScope } from '@/store/composer'
 import { $defaultProfileRoute, setDefaultProfile } from '@/store/default-profile'
 import { requestGatewayForAgent } from '@/store/gateway'
@@ -127,6 +129,7 @@ function reset() {
   session.setConnection(null)
   clearSessionDraft(freshDraftScope())
   $workspaceIsPage.set(false)
+  setWorkspaceScope('sessions')
   $defaultProfileRoute.set(null)
   $newChatRoute.set(null)
   $newChatProfile.set(null)
@@ -232,5 +235,130 @@ describe('the registered New session "+" action (#145594)', () => {
     plus()
     await flush()
     expect(creates()).toHaveLength(2)
+  })
+})
+
+const BOT_ROUTE = { connectionId: 'bot-host', profile: 'lumo' }
+
+function enterBotWorkspace() {
+  setWorkspaceScope('bots', 'bot:lumo', { kind: 'route', route: BOT_ROUTE })
+}
+
+describe('Bot Mode "+" / Ctrl+T while session.create is in flight', () => {
+  it('opens one session when the button is pressed again before create answers', async () => {
+    enterBotWorkspace()
+    const releases = holdCreates()
+    const plus = mountPlus()
+
+    plus()
+    await flush()
+    plus()
+    plus()
+    await flush()
+
+    expect(creates()).toHaveLength(1)
+    expect(creates()[0].slice(0, 2)).toEqual([BOT_ROUTE.connectionId, BOT_ROUTE.profile])
+
+    await act(async () => releases.forEach(release => release()))
+    await flush()
+    expect(states.$sessionTiles.get().map(tile => tile.storedSessionId)).toEqual(['draft-1'])
+
+    // A bot tab is not a reusable blank draft, so the next press is a new chat.
+    plus()
+    await flush()
+    expect(creates()).toHaveLength(2)
+
+    await act(async () => releases[1]())
+    await flush()
+  })
+
+  it('accepts another press after the create fails', async () => {
+    enterBotWorkspace()
+    vi.mocked(requestGatewayForAgent).mockRejectedValueOnce(new Error('request timed out after 30s: session.create'))
+    const plus = mountPlus()
+
+    plus()
+    await flush()
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'rt', stored_session_id: 'bot-draft', info: {} })
+    plus()
+    await flush()
+
+    expect(creates()).toHaveLength(2)
+    expect(states.$sessionTiles.get().map(tile => tile.storedSessionId)).toEqual(['bot-draft'])
+  })
+
+  it('leaves the Sessions "+" free while a bot create is still in flight', async () => {
+    enterBotWorkspace()
+    const releases = holdCreates()
+    const plus = mountPlus()
+
+    plus()
+    await flush()
+    setWorkspaceScope('sessions')
+    plus()
+    await flush()
+
+    expect(creates()).toHaveLength(2)
+
+    await act(async () => releases.forEach(release => release()))
+    await flush()
+  })
+})
+
+describe('opt-in reveal trace (hermes.debug.reveal)', () => {
+  function captureLogLines() {
+    const logLine = vi.fn()
+    window.hermesDesktop = { ...window.hermesDesktop, logLine } as never
+
+    return () => logLine.mock.calls.map(call => String(call[0]))
+  }
+
+  async function openBotTab() {
+    enterBotWorkspace()
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ session_id: 'rt', stored_session_id: 'bot-draft', info: {} })
+    mountPlus()()
+    await flush()
+    session.$selectedStoredSessionId.set('other-chat')
+  }
+
+  it('writes nothing while the flag is absent', async () => {
+    const lines = captureLogLines()
+
+    await openBotTab()
+
+    expect(states.$sessionTiles.get().map(tile => tile.storedSessionId)).toEqual(['bot-draft'])
+    expect(lines().filter(line => /^\[(reveal|selected)-trace/.test(line))).toEqual([])
+  })
+
+  it('records the reveal, the active pane change, and the selection when the flag is 1', async () => {
+    window.localStorage.setItem(REVEAL_TRACE_KEY, '1')
+    const lines = captureLogLines()
+
+    await openBotTab()
+
+    const traced = lines().map((line): null | Record<string, unknown> => {
+      const match = /^\[(reveal|selected)-trace win=main\] (.*)$/.exec(line)
+
+      return match ? { tag: match[1], ...(JSON.parse(match[2]) as Record<string, unknown>) } : null
+    })
+
+    expect(traced).toContainEqual(
+      expect.objectContaining({ event: 'reveal', paneId: 'session-tile:bot-draft', tag: 'reveal' })
+    )
+    expect(traced).toContainEqual(
+      expect.objectContaining({
+        event: 'active',
+        from: 'workspace',
+        groupId: 'main',
+        tag: 'reveal',
+        to: 'session-tile:bot-draft'
+      })
+    )
+    expect(traced).toContainEqual(
+      expect.objectContaining({ event: 'selected', homes: true, selected: 'other-chat', tag: 'selected' })
+    )
+    expect(
+      traced.filter(Boolean).every(entry => typeof entry?.at === 'string' && typeof entry?.stack === 'string')
+    ).toBe(true)
   })
 })

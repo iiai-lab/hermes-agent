@@ -49,6 +49,7 @@ import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
 import { traceIdentityChange } from '@/lib/identity-trace'
 import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+import { traceReveal } from '@/lib/reveal-trace'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -831,6 +832,14 @@ export const host = {
    *  and would otherwise look like every session disappeared. Pass false to
    *  also scope chrome onto that profile and collapse the sidebar. */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
+    traceReveal('selected-trace', {
+      event: 'plugin-open-session',
+      intent: options.intent ?? null,
+      refreshInPlace: Boolean(options.refreshInPlace),
+      storedSessionId,
+      workspaceMode: options.workspaceMode ?? null
+    })
+
     const generation = ++openSessionGeneration
 
     // A new wake owns the syncing affordance — a lingering badge from an
