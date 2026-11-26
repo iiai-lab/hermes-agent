@@ -2799,12 +2799,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # `No module named 'hermes_cli'` (#112729). Pinned last, after every other env decision.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
+    # Leave the gateway cgroup first: a service restart kills the worker mid-handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
+    # This client imports hermes_bootstrap, so prepare_launch(argv=[]) would run the source-update tail.
+    env["HERMES_SUPERVISED_CHILD"] = "1"
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(

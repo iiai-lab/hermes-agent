@@ -164,6 +164,63 @@ def _is_read_only_gateway_status(command: list[str]) -> bool:
     return command[:2] == ["gateway", "status"]
 
 
+# `hermes kanban <verb>` forms that must not finish a source-update tail.
+# `list` / `ls` is named with `show`: a listing is the diagnostic that was
+# running the desktop rebuild. It can still promote ready parents
+# (`recompute_ready`); that promotion is the command, not the update tail.
+_READ_ONLY_KANBAN_VERBS = frozenset({
+    "show",
+    "list", "ls",
+    "stats",
+    "runs",
+    "log",
+    "assignees",
+    "diagnostics", "diag",
+    "attachments",
+    "notify-list",
+    "context",
+    "tail",
+    "watch",
+})
+
+# Options on the kanban parser itself, before the verb. ``command_argv`` strips
+# only top-level flags, so ``--board <slug>`` is still in *command*.
+_KANBAN_PRE_VERB_VALUE_FLAGS = frozenset({"--board"})
+
+
+def _kanban_verb(command: list[str]) -> str | None:
+    """The kanban verb, skipping options the kanban parser accepts first."""
+    if not command or command[0] != "kanban":
+        return None
+    index = 1
+    while index < len(command):
+        token = command[index]
+        if token == "--":
+            index += 1
+            break
+        if token.startswith("-"):
+            name = token.split("=", 1)[0]
+            index += 2 if "=" not in token and name in _KANBAN_PRE_VERB_VALUE_FLAGS else 1
+            continue
+        return token
+    return command[index] if index < len(command) else None
+
+
+def _is_read_only_kanban(command: list[str]) -> bool:
+    """A board read must not finish a source-update tail.
+
+    On 2026-11-27 ``kanban show`` ran that tail (dependency sync and the desktop
+    rebuild) and left Desktop unable to start. A read stays on the tree it has;
+    ``hermes update`` owns the tail.
+    """
+    return _kanban_verb(command) in _READ_ONLY_KANBAN_VERBS
+
+
+def _skips_owed_source_tail(command: list[str]) -> bool:
+    """Diagnostics that answer without finishing an owed source-update tail."""
+    return _is_read_only_gateway_status(command) or _is_read_only_kanban(command)
+
+
 def completion_pending_path(project_root: Path) -> Path:
     """Marker for a source update whose dependency sync committed but whose tail
     (launchers, products, maintenance) has not finished.
@@ -455,7 +512,7 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
             # This is the recovery path shown by the Desktop when a pending update has
             # fenced the gateway. Completing that same tail first can take minutes and
             # leaves the user without the fence diagnosis or a usable restart remedy.
-            or _is_read_only_gateway_status(command)
+            or _skips_owed_source_tail(command)
             or os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", "").lower() in ("1", "true", "yes")
             or not (root / ".git").exists()
             or not (root / "pyproject.toml").is_file()):
