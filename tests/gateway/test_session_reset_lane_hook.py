@@ -507,6 +507,125 @@ async def test_api_compression_lineage_hooks_the_origin_route_key(monkeypatch):
     assert history == [{"role": "user", "content": "from-new"}]
 
 
+def _origin_route_key(chat_id="api-header"):
+    return build_session_key(SessionSource(
+        platform=Platform.API_SERVER, chat_id=chat_id, user_id="api", chat_type="dm"))
+
+
+async def _apply_origin_policy(monkeypatch, *, entry_session_id, plugin, resolve):
+    """One header turn whose origin entry still names *entry_session_id*."""
+    origin = "api-header"
+    store = _RouteStore()
+    key = _origin_route_key(origin)
+    store.entries[key] = _entry(entry_session_id)
+    seen = []
+
+    async def _plugin(name, **kwargs):
+        route = kwargs["gateway"]._session_key_for_source(kwargs["event"].source)
+        seen.append(route)
+        return await plugin(route, kwargs)
+
+    monkeypatch.setattr("gateway.platforms.api_server_runs._resolve_live_session_id", resolve)
+    runner, hook = _runner(store, _plugin)
+    monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", hook)
+    adapter = _adapter("sk-secret")
+    adapter.gateway_runner = runner
+    reloaded = []
+
+    async def _reload(session_id):
+        reloaded.append(session_id)
+        return [{"role": "user", "content": "from-new"}]
+
+    adapter._reload_chat_history = _reload
+    prior = [{"role": "user", "content": "earlier"}]
+    result = await adapter._apply_chat_lane_policy("comp-tip-1", prior, "hello", origin)
+    return result, prior, key, seen, reloaded, store
+
+
+async def _resolve_header_to_tip(_self, session_id):
+    if session_id == "api-header":
+        return "comp-tip-1"
+    return session_id
+
+
+async def _stamp_origin(route, kwargs):
+    kwargs["session_store"].set_session_metadata(route, "srp_last_user_inbound", "2026-11-26T07:00:00")
+    return []
+
+
+@pytest.mark.asyncio
+async def test_api_stale_origin_entry_keeps_the_resolved_tip(monkeypatch):
+    """A stamp must not treat a pre-compression origin entry as a policy move.
+
+    Admission rewrites that entry onto the tip after the hook, so the first
+    request after compression still finds the parent id there. The request's
+    session id is already the live tip.
+    """
+    from gateway.platforms.api_server_openai_routes import _echo_chat_session_id
+
+    (landed, history, moved, dropped), prior, key, seen, reloaded, store = (
+        await _apply_origin_policy(
+            monkeypatch, entry_session_id="api-header", plugin=_stamp_origin,
+            resolve=_resolve_header_to_tip))
+    assert dropped is None
+    assert seen == [key]
+    assert key.endswith("dm:api-header")
+    assert store.entries[key].metadata["srp_last_user_inbound"] == "2026-11-26T07:00:00"
+    assert landed == "comp-tip-1" and moved is False and history is prior and reloaded == []
+    assert _echo_chat_session_id("api-header", landed, policy_moved=moved, result_session="comp-tip-1") == "api-header"
+
+
+@pytest.mark.asyncio
+async def test_api_stale_origin_entry_reset_moves_the_turn(monkeypatch):
+    """A reset written onto the stale origin entry is still a policy move."""
+
+    async def _reset(route, kwargs):
+        kwargs["session_store"].lookup_by_session_key(route).session_id = "reset-child"
+        return []
+
+    (landed, history, moved, dropped), _prior, _key, _seen, reloaded, _store = (
+        await _apply_origin_policy(
+            monkeypatch, entry_session_id="api-header", plugin=_reset,
+            resolve=_resolve_header_to_tip))
+    assert dropped is None
+    assert landed == "reset-child" and moved is True
+    assert reloaded == ["reset-child"]
+    assert history == [{"role": "user", "content": "from-new"}]
+
+
+@pytest.mark.asyncio
+async def test_api_post_reset_entry_still_moves_the_turn(monkeypatch):
+    """After a reset the origin entry names the new lineage, not the old tip.
+
+    Resolving that id to its own live tip must not collapse it back onto the
+    header's pre-reset compression tip.
+    """
+    (landed, history, moved, dropped), _prior, _key, _seen, reloaded, _store = (
+        await _apply_origin_policy(
+            monkeypatch, entry_session_id="reset-child", plugin=_stamp_origin,
+            resolve=_resolve_header_to_tip))
+    assert dropped is None
+    assert landed == "reset-child" and moved is True
+    assert reloaded == ["reset-child"]
+    assert history == [{"role": "user", "content": "from-new"}]
+
+
+@pytest.mark.asyncio
+async def test_api_live_tip_resolver_failure_fails_open(monkeypatch):
+    """A resolver that raises leaves the raw entry id and does not stop the turn."""
+
+    async def _resolve_raises(_self, _session_id):
+        raise RuntimeError("lineage down")
+
+    (landed, _history, moved, dropped), _prior, _key, _seen, reloaded, _store = (
+        await _apply_origin_policy(
+            monkeypatch, entry_session_id="api-header", plugin=_stamp_origin,
+            resolve=_resolve_raises))
+    assert dropped is None
+    assert landed == "api-header" and moved is True
+    assert reloaded == ["api-header"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("authority_cwd_in_tmp")
 async def test_local_reset_prompt_and_a_later_viewer_follow_the_receipt_tip(tmp_path, monkeypatch):

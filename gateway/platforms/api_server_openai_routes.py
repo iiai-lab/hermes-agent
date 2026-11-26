@@ -945,10 +945,12 @@ class OpenAICompatRoutesMixin:
         if hook is None:
             return session_id, history, False, None
         # The route key is the client header, or the derived fingerprint when
-        # there is no header. Compression moves only the entry's session_id
-        # onto the tip and leaves the key on that origin, so a tip chat_id
-        # misses lookup_by_session_key. Landed resolution below still reads
-        # the entry the hook just wrote.
+        # there is no header. A tip chat_id misses lookup_by_session_key, so
+        # the key stays on that origin. Admission is what points the origin
+        # entry's session_id at the compression tip, and it runs after this
+        # hook, so the entry can still name the pre-compression id. The hook
+        # moved the route only when that entry's live tip differs from the
+        # live tip this request already resolved.
         source = _api_turn_source(
             str(provided_session_id or session_id), _api_request_profile.get())
         text = user_message if isinstance(user_message, str) else ""
@@ -962,6 +964,12 @@ class OpenAICompatRoutesMixin:
             return session_id, history, False, _error_response(
                 "Request dropped by pre_gateway_dispatch", 403, code="pre_gateway_dispatch_skip")
         landed = _route_session_after_hook(runner, source, session_id)
+        if landed != session_id and provided_session_id:
+            try:
+                from gateway.platforms.api_server_runs import _resolve_live_session_id
+                landed = await _resolve_live_session_id(self, landed)
+            except Exception as exc:  # health: allow BLE001 -- resolving the landed tip must not stop dispatch; the raw entry id is compared instead
+                logger.warning("pre_gateway_dispatch live-tip resolve failed: %s", exc)
         if landed == session_id:
             return session_id, history, False, None
         if provided_session_id:
