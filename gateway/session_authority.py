@@ -1139,6 +1139,10 @@ class SessionAuthority:
             pending = [admission_row(row) for row in await asyncio.to_thread(store.admissions.list, session_id=ref.session_id)]
             if any(row['status'] == 'unknown' for row in pending):
                 raise AuthorityRefusal('unknown_execution')
+            if await self._fence_orphaned_claim(ref, live, pending):
+                # The head is fenced: the claim below would refuse it, which is the path that
+                # settles an unattended row (and pauses for a person's Discard).
+                raise AuthorityRefusal('unknown_execution')
             first = next((row for row in pending if row['status'] == 'queued'), None)
             from gateway.config import Platform
             if live.source.platform == Platform.LOCAL:
@@ -1236,6 +1240,37 @@ class SessionAuthority:
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
             # instead of letting the drain exit idle over a committed admission.
             return (False if row is None and live.rescan else row), first
+
+    async def _fence_orphaned_claim(self, ref, live, pending):
+        """This owner's ``started`` row that nothing is executing is a claim whose drain died before
+        the turn ran, and no follower would ever be claimed past it. Fence it ``unknown``
+        (``admissions.orphan_claim``) and let the policies that already clear a fenced row
+        (``settle_unattended_unknown``, or the operator's Discard) resume the FIFO.
+
+        Every ``started`` row is checked, not only the head: a row returned to its earlier ``seq``
+        (a reverted steer) can sort ahead of a claim that is still ``started``, and the claim verb
+        refuses on any started row anywhere in the session."""
+        if not any(row['status'] == 'started' and row['owner_epoch'] == self.epoch for row in pending):
+            return False
+        running = self.executing.get(ref.session_id)
+        from gateway.session_runtime_workers import tracked_write
+        store = authority_persistence(self)
+        fenced = []
+        while True:
+            row = await tracked_write(self, partial(store.admissions.orphan_claim, epoch=self.epoch,
+                                                    session_id=ref.session_id, running=running))
+            if row is None:
+                break
+            fenced.append(row)
+        if not fenced:
+            return False
+        import logging
+        logging.getLogger(__name__).warning(
+            'Session %s: fenced %d claim(s) nothing executes (%s); its FIFO resumes',
+            ref.session_id, len(fenced), ', '.join(f"{row.admission_id}/gen {row.generation}" for row in fenced))
+        with live.event_stream.lock:
+            self._publish_pending(ref)
+        return True
 
     def _stamp_claim(self, ref, live, row):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
@@ -1349,6 +1384,23 @@ class SessionAuthority:
                 return None
             await asyncio.sleep(_CLAIM_RETRY_MIN_S)
 
+    async def _finished_card_notice(self, ref, live, row):
+        """The turn's reply when *row* is a Kanban notice whose card is already finished (archived
+        or done), else None. Checked here, at the claim, so a notice already sitting in the FIFO is
+        also dropped: the board may have moved on while it waited. Nothing is sent to the chat and no
+        model turn runs; the row settles like any notice that answered without work.
+
+        The text check is inline (every ordinary turn pays only a regex over a payload already in
+        memory); the board read runs off the loop and only when a notice actually names a card."""
+        from gateway.session_automation import finished_card_notice, notice_task_id
+        task_id = notice_task_id(row)
+        if task_id is None or not await asyncio.to_thread(finished_card_notice, task_id):
+            return None
+        import logging
+        logging.getLogger(__name__).info(
+            'Session %s: dropped a notice for Kanban task %s, which is already finished', ref.session_id, task_id)
+        return ''
+
     async def _execute_claimed(self, ref, live, row):
         """Run the claimed admission: ``(response, outcome)``. The executing stamp clears the moment
         execution returns; a lost managed worker settles an automation turn (``settled_unknown``) or pauses
@@ -1359,6 +1411,9 @@ class SessionAuthority:
         from gateway.session_open import settled
         try:
             try:
+                dropped = await self._finished_card_notice(ref, live, row)
+                if dropped is not None:
+                    return dropped, 'completed'
                 if review is not None and not review.request_done.is_set():
                     # A cold /refine's review shares the session id, as the resident agent's does:
                     # cancel it before the turn (its bounded wait runs off-loop). Inside the try: a

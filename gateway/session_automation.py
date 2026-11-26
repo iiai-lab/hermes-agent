@@ -354,6 +354,48 @@ def _owner(runner, event, authority):
     return entry
 
 
+# A Kanban status notice names its card. Once that card is ``archived`` or ``done`` the notice only
+# describes work nobody can act on any more: dropped right before delivery instead of spending a turn.
+_FINISHED_CARD_STATUSES = frozenset({'archived', 'done'})
+# The gateway's own wake notice, whose first line is ``"[kanban] Task t_1a2b3c4d completed."``
+# (``gateway.kanban.wake.message``). Anchored at the message's start on purpose: a card's own work
+# turn says "work kanban task" and carries ``kanban_card_v1``, and no message somebody composed —
+# a DM saying "I archived t_1a2b3c4d" — can match this, so the rule can only ever drop a notice the
+# gateway generated.
+_NOTICE_TASK_ID = re.compile(r'^\[kanban\][^\n]*?\bTask (t_[0-9a-f]{8})\b')
+
+
+def notice_task_id(row):
+    """The card a gateway-generated notice names, or None: the cheap half of
+    ``finished_card_notice``, run inline by the drain so an ordinary turn never pays for the board read.
+
+    Only an unattended producer row can be a notice. A person's message — a DM quoting a board line —
+    is never dropped, whatever it says, and neither is a card's own work turn."""
+    from gateway.session_unattended_unknown import is_unattended
+    payload = row.get('payload') or {}
+    if 'kanban_card_v1' in payload or not is_unattended(row):
+        return None
+    match = _NOTICE_TASK_ID.match(str(payload.get('text') or ''))
+    return None if match is None else match.group(1)
+
+
+def finished_card_notice(task_id):
+    """Whether *task_id* is already ``archived`` or ``done`` on the board this gateway delivers for.
+
+    A card the board does not hold (another board, an older build's export) is not finished as far
+    as this check can tell, and an unreadable board proves nothing either: both deliver the notice.
+    A dropped notice is worse than a late one, so every doubt resolves toward sending."""
+    from hermes_cli import kanban_db_connect as kbc
+    import sqlite3
+    try:
+        with kbc.connect_closing() as conn:
+            row = conn.execute('SELECT status FROM tasks WHERE id=?', (task_id,)).fetchone()
+    except (OSError, sqlite3.Error, kbc.KanbanDbCorruptError) as exc:
+        logger.debug('kanban notice: board unreadable (%s); delivering the notice', exc)
+        return False
+    return row is not None and row[0] in _FINISHED_CARD_STATUSES
+
+
 def automation_notification_metadata(metadata):
     """Validate trusted producer category; omit the default from old fingerprints."""
     category = metadata.get('notification_category', 'result')

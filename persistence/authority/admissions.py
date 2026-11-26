@@ -271,6 +271,17 @@ class AdmissionRepository(Protocol):
         """
         ...
 
+    def orphan_claim(self, *, epoch: int, session_id: str, running: int | None = None) -> AdmissionRecord | None:
+        """Fence this owner's ``started`` head that nothing is executing, before a claim waits on it.
+
+        The oldest ``started`` row whose owner is ``epoch`` and whose generation is not ``running``
+        goes ``unknown`` in one write, a steering transfer committed to that generation settles
+        ``interrupted`` (never replayed), and the session revision bumps; ``None`` when no such row
+        is left. A worker execution bound to the claim means somebody can still end it: the row is
+        left alone. Call it until it answers ``None`` to clear every orphan in one drain.
+        """
+        ...
+
     def settle(self, *, epoch: int, admission_id: str, generation: int, outcome: Literal['completed', 'interrupted', 'rejected', 'failed'], result: Mapping[str, Any] | None = None, transfers: Mapping[str, bool] | None = None, boundary: TurnBoundary | None = None) -> AdmissionRecord:
         """Settle a started admission.
 
