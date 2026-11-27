@@ -1,5 +1,5 @@
-"""A Bot Chat FIFO never stalls behind a claim nobody executes, and never delivers a notice whose
-named Kanban card is finished (archived or done).
+"""A Bot Chat FIFO never stalls behind a claim nobody executes, and never spends a turn on a stale
+Kanban notice.
 
 A ``started`` head is normally a turn this owner is running. When the drain that claimed it dies
 before the turn starts (a cancellation, a profile teardown racing the claim), the row stays
@@ -7,9 +7,11 @@ before the turn starts (a cancellation, a profile teardown racing the claim), th
 behind it for good: one Bot Chat sat ~5 hours behind such a row. The owner now fences its own
 orphaned claim at the next claim and the existing unattended policy settles it, so the followers run.
 
-A Kanban status notice names its card. Once that card is archived or done the notice is stale: it
-is dropped at the claim, which is also after it was queued, so a notice waiting in the FIFO for a
-busy chat never spends a turn on a card nobody can act on.
+A Kanban status notice names its card. At the claim — also after it was queued — a notice is dropped
+when its card is archived (beyond anyone's reach) or done while the notice reports something other
+than that completion. A done card's own completion wake is delivered: ``complete_task`` already wrote
+``done`` when it wrote the wake, so dropping on ``done`` alone loses the notice the owner waits for.
+A notice with no readable status set is delivered too: a late notice beats a lost one.
 """
 from types import SimpleNamespace
 
