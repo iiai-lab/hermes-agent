@@ -83,6 +83,11 @@ class SQLiteAdmissionRepository:
             return _record(store.return_session_claim(self._store.holder(), epoch=epoch, admission_id=admission_id,
                                                       generation=generation, queued_owner_epoch=queued_owner_epoch))
 
+    def orphan_claim(self, *, epoch: int, session_id: str, running: int | None = None) -> AdmissionRecord | None:
+        with refused():
+            return _record(store.orphan_session_claim(self._store.holder(), epoch=epoch, session_id=session_id,
+                                                      running=running))
+
     def settle(self, *, epoch: int, admission_id: str, generation: int,
                outcome: Literal["completed", "interrupted", "rejected", "failed"],
                result: Mapping[str, Any] | None = None, transfers: Mapping[str, bool] | None = None,

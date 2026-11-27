@@ -47,6 +47,7 @@ __all__ = [
     "get_session_admission",
     "latest_session_admission",
     "list_session_admissions",
+    "orphan_session_claim",
     "recover_session_inputs",
     "rehome_queued_inputs",
     "resolve_unknown_session_input",
@@ -186,6 +187,44 @@ def claim_session_input(holder, *, epoch: int, session_id: str, gate=None, head=
         claimed['transcript_mark'] = conn.execute('SELECT COALESCE(MAX(id), 0) FROM messages').fetchone()[0]
         claimed['queued_owner_epoch'] = row['owner_epoch']
         return claimed
+    return holder._execute_write(write)
+
+
+def orphan_session_claim(holder, *, epoch: int, session_id: str, running: int | None) -> dict | None:
+    """The ``started`` head this owner claimed and then lost before any turn ran, moved to ``unknown``.
+
+    A claim whose drain dies between the claim and the execution (a cancellation, a teardown that
+    raced the write) leaves a ``started`` row nothing will ever settle, and ``claim_session_input``
+    refuses every follower behind it for good: one Bot Chat waited ~5 hours on such a row. The
+    next claim fences it the same way a turn lost across an owner restart is fenced
+    (``recover_session_inputs``), so the settled-by-policy paths (an unattended automation row, or
+    the operator's Discard) can clear the head instead of waiting for a turn that does not exist.
+
+    Only THIS owner's claim is a candidate (``owner_epoch``) and never the generation *running* (the
+    drain that claims next is not the one executing it). A worker execution bound to the claim means
+    somebody can still end it, so the row is left alone; a steering transfer committed to it can
+    never be delivered now, and settles ``interrupted`` like every other steer handed to a lost claim.
+    ``None`` when the head is not such a row. The revision bump tells viewers the pending set changed."""
+    def write(conn):
+        _epoch(conn, epoch)
+        head = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='started' "
+                            "ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+        if head is None or head['owner_epoch'] != epoch or type(head['generation']) is not int:
+            return None
+        if running is not None and head['generation'] == running:
+            return None
+        lineage = json.loads(head['lineage_json'])
+        targets = list({head['target_session_id'], lineage[-1] if lineage else head['target_session_id']})
+        if conn.execute(f"SELECT 1 FROM worker_executions WHERE session_id IN ({','.join('?' * len(targets))}) "
+                        "AND owner_epoch=? AND generation=? LIMIT 1", (*targets, epoch, head['generation'])).fetchone():
+            return None
+        conn.execute("UPDATE session_admissions SET status='unknown' WHERE admission_id=? AND status='started'",
+                     (head['admission_id'],))
+        conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE target_session_id=? "
+                     "AND status='terminal' AND outcome=? AND owner_epoch=? AND generation=?",
+                     (head['target_session_id'], STEERING, epoch, head['generation']))
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (head['target_session_id'],))
+        return _row(_admission(conn, head['admission_id']))
     return holder._execute_write(write)
 
 
